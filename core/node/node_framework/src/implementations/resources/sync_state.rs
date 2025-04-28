@@ -1,12 +1,19 @@
-use zksync_core::sync_layer::SyncState;
+use zksync_node_sync::SyncState;
 
-use crate::resource::{Resource, ResourceId};
+use crate::resource::Resource;
 
+/// A resource that provides [`SyncState`] to the service.
 #[derive(Debug, Clone)]
 pub struct SyncStateResource(pub SyncState);
 
 impl Resource for SyncStateResource {
-    fn resource_id() -> ResourceId {
-        "sync_state".into()
+    fn name() -> String {
+        "common/sync_state".into()
+    }
+}
+
+impl From<SyncState> for SyncStateResource {
+    fn from(sync_state: SyncState) -> Self {
+        Self(sync_state)
     }
 }

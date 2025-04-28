@@ -1,5 +1,6 @@
-use zkevm_test_harness_1_4_0::{geometry_config::get_geometry_config, toolset::GeometryConfig};
-use zksync_types::circuit::{CircuitCycleStatistic, CircuitStatistic};
+use circuit_sequencer_api::geometry_config::{GeometryConfig, ProtocolGeometry};
+
+use crate::{interface::CircuitStatistic, utils::CircuitCycleStatistic};
 
 // "Rich addressing" opcodes are opcodes that can write their return value/read the input onto the stack
 // and so take 1-2 RAM permutations more than an average opcode.
@@ -39,7 +40,7 @@ pub(crate) const UMA_READ_RAM_CYCLES: u32 = 3;
 pub(crate) const PRECOMPILE_RAM_CYCLES: u32 = 1;
 pub(crate) const PRECOMPILE_LOG_DEMUXER_CYCLES: u32 = 1;
 
-const GEOMETRY_CONFIG: GeometryConfig = get_geometry_config();
+const GEOMETRY_CONFIG: GeometryConfig = ProtocolGeometry::V1_4_0.config();
 
 pub(crate) fn circuit_statistic_from_cycles(cycles: CircuitCycleStatistic) -> CircuitStatistic {
     CircuitStatistic {
@@ -63,5 +64,8 @@ pub(crate) fn circuit_statistic_from_cycles(cycles: CircuitCycleStatistic) -> Ci
         ecrecover: cycles.ecrecover_cycles as f32
             / GEOMETRY_CONFIG.cycles_per_ecrecover_circuit as f32,
         sha256: cycles.sha256_cycles as f32 / GEOMETRY_CONFIG.cycles_per_sha256_circuit as f32,
+        secp256k1_verify: 0.0,
+        transient_storage_checker: 0.0,
+        ..Default::default()
     }
 }

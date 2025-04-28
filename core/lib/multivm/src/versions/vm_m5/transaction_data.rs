@@ -1,17 +1,21 @@
 use zk_evm_1_3_1::zkevm_opcode_defs::system_params::{MAX_PUBDATA_PER_BLOCK, MAX_TX_ERGS_LIMIT};
 use zksync_types::{
+    address_to_h256,
+    bytecode::BytecodeHash,
+    ceil_div_u256,
     ethabi::{encode, Address, Token},
     fee::encoding_len,
+    h256_to_u256,
     l2::TransactionType,
     ExecuteTransactionCommon, Transaction, U256,
 };
-use zksync_utils::{
-    address_to_h256, bytecode::hash_bytecode, bytes_to_be_words, ceil_div_u256, h256_to_u256,
-};
 
 use super::vm_with_bootloader::MAX_GAS_PER_PUBDATA_BYTE;
-use crate::vm_m5::vm_with_bootloader::{
-    BLOCK_OVERHEAD_GAS, BLOCK_OVERHEAD_PUBDATA, BOOTLOADER_TX_ENCODING_SPACE, MAX_TXS_IN_BLOCK,
+use crate::{
+    utils::bytecode::bytes_to_be_words,
+    vm_m5::vm_with_bootloader::{
+        BLOCK_OVERHEAD_GAS, BLOCK_OVERHEAD_PUBDATA, BOOTLOADER_TX_ENCODING_SPACE, MAX_TXS_IN_BLOCK,
+    },
 };
 
 const L1_TX_TYPE: u8 = 255;
@@ -22,7 +26,7 @@ const L1_TX_TYPE: u8 = 255;
 pub struct TransactionData {
     pub tx_type: u8,
     pub from: Address,
-    pub to: Address,
+    pub to: Option<Address>,
     pub gas_limit: U256,
     pub pubdata_price_limit: U256,
     pub max_fee_per_gas: U256,
@@ -89,7 +93,7 @@ impl From<Transaction> for TransactionData {
                     ],
                     data: execute_tx.execute.calldata,
                     signature: common_data.signature.clone(),
-                    factory_deps: execute_tx.execute.factory_deps.unwrap_or_default(),
+                    factory_deps: execute_tx.execute.factory_deps,
                     paymaster_input: common_data.paymaster_params.paymaster_input.clone(),
                     reserved_dynamic: vec![],
                 }
@@ -118,7 +122,7 @@ impl From<Transaction> for TransactionData {
                     data: execute_tx.execute.calldata,
                     // The signature isn't checked for L1 transactions so we don't care
                     signature: vec![],
-                    factory_deps: execute_tx.execute.factory_deps.unwrap_or_default(),
+                    factory_deps: execute_tx.execute.factory_deps,
                     paymaster_input: vec![],
                     reserved_dynamic: vec![],
                 }
@@ -144,7 +148,7 @@ impl TransactionData {
         encode(&[Token::Tuple(vec![
             Token::Uint(U256::from_big_endian(&self.tx_type.to_be_bytes())),
             Token::Address(self.from),
-            Token::Address(self.to),
+            Token::Address(self.to.unwrap_or_default()),
             Token::Uint(self.gas_limit),
             Token::Uint(self.pubdata_price_limit),
             Token::Uint(self.max_fee_per_gas),
@@ -165,16 +169,13 @@ impl TransactionData {
         let factory_deps_hashes = self
             .factory_deps
             .iter()
-            .map(|dep| h256_to_u256(hash_bytecode(dep)))
+            .map(|dep| BytecodeHash::for_bytecode(dep).value_u256())
             .collect();
         self.abi_encode_with_custom_factory_deps(factory_deps_hashes)
     }
 
     pub fn into_tokens(self) -> Vec<U256> {
-        let bytes = self.abi_encode();
-        assert!(bytes.len() % 32 == 0);
-
-        bytes_to_be_words(bytes)
+        bytes_to_be_words(&self.abi_encode())
     }
 
     pub fn overhead_gas(&self) -> u32 {
@@ -229,14 +230,13 @@ impl TransactionData {
 }
 
 pub(crate) fn derive_overhead(
-    gas_limit: u32,
+    gas_limit: u64,
     gas_price_per_pubdata: u32,
     encoded_len: usize,
 ) -> u32 {
-    assert!(
-        gas_limit <= MAX_TX_ERGS_LIMIT,
-        "gas limit is larger than the maximal one"
-    );
+    // Even if the gas limit is greater than the `MAX_TX_ERGS_LIMIT`, we assume that everything beyond `MAX_TX_ERGS_LIMIT`
+    // will be spent entirely on publishing bytecodes and so we derive the overhead solely based on the capped value
+    let gas_limit = std::cmp::min(MAX_TX_ERGS_LIMIT as u64, gas_limit);
 
     // Using large U256 type to avoid overflow
     let max_block_overhead = U256::from(block_overhead_gas(gas_price_per_pubdata));
@@ -418,7 +418,7 @@ mod tests {
         // is >= than the overhead proposed by the operator.
         let is_overhead_accepted = |suggested_overhead: u32| {
             let derived_overhead = derive_overhead(
-                total_gas_limit - suggested_overhead,
+                (total_gas_limit - suggested_overhead) as u64,
                 gas_per_pubdata_byte_limit,
                 encoded_len,
             );
@@ -471,7 +471,7 @@ mod tests {
         test_params(0, 1, 12);
 
         // Relatively big parameters
-        let max_tx_overhead = derive_overhead(MAX_TX_ERGS_LIMIT, 5000, 10000);
+        let max_tx_overhead = derive_overhead(MAX_TX_ERGS_LIMIT as u64, 5000, 10000);
         test_params(MAX_TX_ERGS_LIMIT + max_tx_overhead, 5000, 10000);
     }
 
@@ -480,7 +480,7 @@ mod tests {
         let transaction = TransactionData {
             tx_type: 113,
             from: Address::random(),
-            to: Address::random(),
+            to: Some(Address::random()),
             gas_limit: U256::from(1u32),
             pubdata_price_limit: U256::from(1u32),
             max_fee_per_gas: U256::from(1u32),

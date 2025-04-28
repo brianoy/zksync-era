@@ -1,9 +1,10 @@
 import { TestMessage } from './matcher-helpers';
 import { MatcherModifier } from '../modifiers';
-import * as zksync from 'zksync-web3';
-import { AugmentedTransactionResponse } from '../retry-provider';
+import * as zksync from 'zksync-ethers';
+import { AugmentedTransactionResponse } from '../transaction-response';
+import { ethers } from 'ethers';
 
-// This file contains implementation of matchers for zkSync/ethereum transaction.
+// This file contains implementation of matchers for ZKsync/ethereum transaction.
 // For actual doc-comments, see `typings/jest.d.ts` file.
 
 export async function toBeAccepted(
@@ -207,7 +208,7 @@ function fail(message: string) {
  *
  * @returns If check has failed, returns a Jest error object. Otherwise, returns `undefined`.
  */
-function checkReceiptFields(request: zksync.types.TransactionResponse, receipt: zksync.types.TransactionReceipt) {
+function checkReceiptFields(request: ethers.TransactionResponseParams, receipt: zksync.types.TransactionReceipt) {
     const errorMessageBuilder = new TestMessage()
         .matcherHint('.checkReceiptFields')
         .line('Transaction receipt is not properly formatted. Transaction request:')
@@ -219,7 +220,8 @@ function checkReceiptFields(request: zksync.types.TransactionResponse, receipt: 
     if (receipt.status !== 0 && receipt.status !== 1) {
         return failWith(`Status field in the receipt has an unexpected value (expected 0 or 1): ${receipt.status}`);
     }
-    if (!receipt.effectiveGasPrice) {
+    const effectiveGasPrice = receipt.gasUsed * receipt.gasPrice;
+    if (effectiveGasPrice <= 0n) {
         return failWith(`Effective gas price expected to be greater than 0`);
     }
     if (!receipt.gasUsed) {

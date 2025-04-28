@@ -1,43 +1,48 @@
-use std::{env, error, str::FromStr};
+use std::env;
 
-use anyhow::Context as _;
-use zksync_config::{DBConfig, PostgresConfig};
+use zksync_config::{configs::DatabaseSecrets, DBConfig, PostgresConfig};
 
-use crate::{envy_load, FromEnv};
-
-fn parse_optional_var<T>(name: &str) -> anyhow::Result<Option<T>>
-where
-    T: FromStr,
-    T::Err: 'static + error::Error + Send + Sync,
-{
-    env::var(name)
-        .ok()
-        .map(|val| {
-            val.parse()
-                .with_context(|| format!("failed to parse env variable {name}"))
-        })
-        .transpose()
-}
+use crate::{envy_load, utils::parse_optional_var, FromEnv};
 
 impl FromEnv for DBConfig {
     fn from_env() -> anyhow::Result<Self> {
         Ok(Self {
             merkle_tree: envy_load("database_merkle_tree", "DATABASE_MERKLE_TREE_")?,
+            experimental: envy_load("database_experimental", "DATABASE_EXPERIMENTAL_")?,
             ..envy_load("database", "DATABASE_")?
+        })
+    }
+}
+
+impl FromEnv for DatabaseSecrets {
+    fn from_env() -> anyhow::Result<Self> {
+        let server_url = env::var("DATABASE_URL")
+            .ok()
+            .map(|s| s.parse())
+            .transpose()?;
+        let server_replica_url = env::var("DATABASE_REPLICA_URL")
+            .ok()
+            .map(|s| s.parse())
+            .transpose()?
+            .or_else(|| server_url.clone());
+        let prover_url = env::var("DATABASE_PROVER_URL")
+            .ok()
+            .map(|s| s.parse())
+            .transpose()?
+            .or_else(|| server_url.clone());
+
+        Ok(Self {
+            server_url,
+            prover_url,
+            server_replica_url,
         })
     }
 }
 
 impl FromEnv for PostgresConfig {
     fn from_env() -> anyhow::Result<Self> {
-        let master_url = env::var("DATABASE_URL").ok();
-        let replica_url = env::var("DATABASE_REPLICA_URL")
-            .ok()
-            .or_else(|| master_url.clone());
-        let prover_url = env::var("DATABASE_PROVER_URL")
-            .ok()
-            .or_else(|| master_url.clone());
         let max_connections = parse_optional_var("DATABASE_POOL_SIZE")?;
+        let max_connections_master = parse_optional_var("DATABASE_POOL_SIZE_MASTER")?;
         let acquire_timeout_sec = parse_optional_var("DATABASE_ACQUIRE_TIMEOUT_SEC")?;
         let statement_timeout_sec = parse_optional_var("DATABASE_STATEMENT_TIMEOUT_SEC")?;
         let long_connection_threshold_ms =
@@ -45,10 +50,8 @@ impl FromEnv for PostgresConfig {
         let slow_query_threshold_ms = parse_optional_var("DATABASE_SLOW_QUERY_THRESHOLD_MS")?;
 
         Ok(Self {
-            master_url,
-            replica_url,
-            prover_url,
             max_connections,
+            max_connections_master,
             acquire_timeout_sec,
             statement_timeout_sec,
             long_connection_threshold_ms,
@@ -59,7 +62,7 @@ impl FromEnv for PostgresConfig {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{num::NonZeroU32, time::Duration};
 
     use zksync_config::configs::database::MerkleTreeMode;
 
@@ -79,6 +82,9 @@ mod tests {
             DATABASE_MERKLE_TREE_MEMTABLE_CAPACITY_MB=512
             DATABASE_MERKLE_TREE_STALLED_WRITES_TIMEOUT_SEC=60
             DATABASE_MERKLE_TREE_MAX_L1_BATCHES_PER_ITER=50
+            DATABASE_EXPERIMENTAL_STATE_KEEPER_DB_BLOCK_CACHE_CAPACITY_MB=64
+            DATABASE_EXPERIMENTAL_STATE_KEEPER_DB_MAX_OPEN_FILES=100
+            DATABASE_EXPERIMENTAL_MERKLE_TREE_REPAIR_STALE_KEYS=true
         "#;
         lock.set_env(config);
 
@@ -90,6 +96,17 @@ mod tests {
         assert_eq!(db_config.merkle_tree.max_l1_batches_per_iter, 50);
         assert_eq!(db_config.merkle_tree.memtable_capacity_mb, 512);
         assert_eq!(db_config.merkle_tree.stalled_writes_timeout_sec, 60);
+        assert_eq!(
+            db_config
+                .experimental
+                .state_keeper_db_block_cache_capacity_mb,
+            64
+        );
+        assert_eq!(
+            db_config.experimental.state_keeper_db_max_open_files,
+            NonZeroU32::new(100)
+        );
+        assert!(db_config.experimental.merkle_tree_repair_stale_keys);
     }
 
     #[test]
@@ -97,6 +114,9 @@ mod tests {
         let mut lock = MUTEX.lock();
         lock.remove_env(&[
             "DATABASE_STATE_KEEPER_DB_PATH",
+            "DATABASE_EXPERIMENTAL_STATE_KEEPER_DB_MAX_OPEN_FILES",
+            "DATABASE_EXPERIMENTAL_STATE_KEEPER_DB_BLOCK_CACHE_CAPACITY_MB",
+            "DATABASE_EXPERIMENTAL_MERKLE_TREE_REPAIR_STALE_KEYS",
             "DATABASE_MERKLE_TREE_BACKUP_PATH",
             "DATABASE_MERKLE_TREE_PATH",
             "DATABASE_MERKLE_TREE_MODE",
@@ -116,6 +136,14 @@ mod tests {
         assert_eq!(db_config.merkle_tree.block_cache_size_mb, 128);
         assert_eq!(db_config.merkle_tree.memtable_capacity_mb, 256);
         assert_eq!(db_config.merkle_tree.stalled_writes_timeout_sec, 30);
+        assert_eq!(
+            db_config
+                .experimental
+                .state_keeper_db_block_cache_capacity_mb,
+            128
+        );
+        assert_eq!(db_config.experimental.state_keeper_db_max_open_files, None);
+        assert!(!db_config.experimental.merkle_tree_repair_stale_keys);
 
         // Check that new env variable for Merkle tree path is supported
         lock.set_env("DATABASE_MERKLE_TREE_PATH=/db/tree/main");
@@ -149,10 +177,6 @@ mod tests {
         lock.set_env(config);
 
         let postgres_config = PostgresConfig::from_env().unwrap();
-        assert_eq!(
-            postgres_config.master_url().unwrap(),
-            "postgres://postgres:notsecurepassword@localhost/zksync_local"
-        );
         assert_eq!(postgres_config.max_connections().unwrap(), 50);
         assert_eq!(
             postgres_config.statement_timeout(),
@@ -169,6 +193,36 @@ mod tests {
         assert_eq!(
             postgres_config.slow_query_threshold(),
             Some(Duration::from_millis(150))
+        );
+    }
+    #[test]
+    fn database_secrets_from_env() {
+        let mut lock = MUTEX.lock();
+        let config = r#"
+            DATABASE_URL=postgres://postgres:notsecurepassword@localhost/zksync_local
+            DATABASE_REPLICA_URL=postgres://postgres:notsecurepassword@localhost/zksync_replica_local
+            DATABASE_PROVER_URL=postgres://postgres:notsecurepassword@localhost/zksync_prover_local
+        "#;
+        lock.set_env(config);
+
+        let postgres_config = DatabaseSecrets::from_env().unwrap();
+        assert_eq!(
+            postgres_config.replica_url().unwrap(),
+            "postgres://postgres:notsecurepassword@localhost/zksync_replica_local"
+                .parse()
+                .unwrap()
+        );
+        assert_eq!(
+            postgres_config.master_url().unwrap(),
+            "postgres://postgres:notsecurepassword@localhost/zksync_local"
+                .parse()
+                .unwrap()
+        );
+        assert_eq!(
+            postgres_config.prover_url().unwrap(),
+            "postgres://postgres:notsecurepassword@localhost/zksync_prover_local"
+                .parse()
+                .unwrap()
         );
     }
 }

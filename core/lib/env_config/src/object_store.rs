@@ -8,17 +8,6 @@ impl FromEnv for ObjectStoreConfig {
     }
 }
 
-/// Wrapper for `ObjectStoreConfig` that allows loading object store config using `PUBLIC_` prefix.
-#[derive(Debug)]
-pub struct PublicObjectStoreConfig(pub ObjectStoreConfig);
-
-impl FromEnv for PublicObjectStoreConfig {
-    fn from_env() -> anyhow::Result<Self> {
-        let config = envy_load("public_object_store", "PUBLIC_OBJECT_STORE_")?;
-        Ok(Self(config))
-    }
-}
-
 /// Wrapper for `ObjectStoreConfig` that allows loading object store config using `PROVER_` prefix.
 #[derive(Debug)]
 pub struct ProverObjectStoreConfig(pub ObjectStoreConfig);
@@ -56,6 +45,7 @@ mod tests {
                 gcs_credential_file_path: "/path/to/credentials.json".to_owned(),
             },
             max_retries: 5,
+            local_mirror_path: Some("/var/cache".to_owned()),
         }
     }
 
@@ -67,6 +57,7 @@ mod tests {
             OBJECT_STORE_MODE="GCSWithCredentialFile"
             OBJECT_STORE_GCS_CREDENTIAL_FILE_PATH="/path/to/credentials.json"
             OBJECT_STORE_MAX_RETRIES="5"
+            OBJECT_STORE_LOCAL_MIRROR_PATH="/var/cache"
         "#;
         lock.set_env(config);
         let actual = ObjectStoreConfig::from_env().unwrap();
@@ -91,25 +82,6 @@ mod tests {
     }
 
     #[test]
-    fn public_bucket_config_from_env() {
-        let mut lock = MUTEX.lock();
-        let config = r#"
-            PUBLIC_OBJECT_STORE_BUCKET_BASE_URL="/public_base_url"
-            PUBLIC_OBJECT_STORE_MODE="GCSAnonymousReadOnly"
-            PUBLIC_OBJECT_STORE_MAX_RETRIES="3"
-        "#;
-        lock.set_env(config);
-        let actual = PublicObjectStoreConfig::from_env().unwrap().0;
-        assert_eq!(actual.max_retries, 3);
-        assert_eq!(
-            actual.mode,
-            ObjectStoreMode::GCSAnonymousReadOnly {
-                bucket_base_url: "/public_base_url".to_owned(),
-            }
-        );
-    }
-
-    #[test]
     fn prover_bucket_config_from_env() {
         let mut lock = MUTEX.lock();
         let config = r#"
@@ -117,6 +89,7 @@ mod tests {
             PROVER_OBJECT_STORE_MODE="GCSWithCredentialFile"
             PROVER_OBJECT_STORE_GCS_CREDENTIAL_FILE_PATH="/path/to/credentials.json"
             PROVER_OBJECT_STORE_MAX_RETRIES="5"
+            PROVER_OBJECT_STORE_LOCAL_MIRROR_PATH="/var/cache"
         "#;
         lock.set_env(config);
         let actual = ProverObjectStoreConfig::from_env().unwrap().0;

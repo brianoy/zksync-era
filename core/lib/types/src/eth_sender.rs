@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use zksync_basic_types::SLChainId;
 
 use crate::{aggregated_operations::AggregatedActionType, Address, Nonce, H256};
 
@@ -46,11 +47,13 @@ pub struct EthTx {
     pub raw_tx: Vec<u8>,
     pub tx_type: AggregatedActionType,
     pub created_at_timestamp: u64,
-    pub predicted_gas_cost: u64,
+    pub predicted_gas_cost: Option<u64>,
     /// If this field is `Some` then it contains address of a custom operator that has sent
     /// this transaction. If it is set to `None` this transaction was sent by the main operator.
     pub from_addr: Option<Address>,
     pub blob_sidecar: Option<EthTxBlobSidecar>,
+    pub is_gateway: bool,
+    pub chain_id: Option<SLChainId>,
 }
 
 impl std::fmt::Debug for EthTx {
@@ -63,6 +66,7 @@ impl std::fmt::Debug for EthTx {
             .field("tx_type", &self.tx_type)
             .field("created_at_timestamp", &self.created_at_timestamp)
             .field("predicted_gas_cost", &self.predicted_gas_cost)
+            .field("chain_id", &self.chain_id)
             .finish()
     }
 }
@@ -77,15 +81,6 @@ pub struct TxHistory {
     pub tx_hash: H256,
     pub signed_raw_tx: Vec<u8>,
     pub sent_at_block: Option<u32>,
-}
-
-#[derive(Clone, Debug)]
-pub struct TxHistoryToSend {
-    pub id: u32,
-    pub eth_tx_id: u32,
-    pub base_fee_per_gas: u64,
-    pub priority_fee_per_gas: u64,
-    pub tx_hash: H256,
-    pub signed_raw_tx: Vec<u8>,
-    pub nonce: Nonce,
+    pub max_gas_per_pubdata: Option<u64>,
+    pub sent_successfully: bool,
 }

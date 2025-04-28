@@ -6,16 +6,19 @@ use zk_evm_1_4_1::{
         FatPointer, RET_IMPLICIT_RETURNDATA_PARAMS_REGISTER,
     },
 };
-use zksync_state::WriteStorage;
 use zksync_types::{Address, U256};
 
-use crate::vm_1_4_1::{old_vm::memory::SimpleMemory, types::internals::ZkSyncVmState, HistoryMode};
+use crate::{
+    interface::storage::WriteStorage,
+    vm_1_4_1::{old_vm::memory::SimpleMemory, types::internals::ZkSyncVmState, HistoryMode},
+};
 
 #[derive(Debug, Clone)]
 pub(crate) enum VmExecutionResult {
     Ok(Vec<u8>),
     Revert(Vec<u8>),
     Panic,
+    #[allow(dead_code)]
     MostLikelyDidNotFinish(Address, u16),
 }
 
@@ -31,6 +34,7 @@ pub(crate) const fn aux_heap_page_from_base(base: MemoryPage) -> MemoryPage {
     MemoryPage(base.0 + 3)
 }
 
+#[allow(dead_code)]
 pub(crate) trait FixedLengthIterator<'a, I: 'a, const N: usize>: Iterator<Item = I>
 where
     Self: 'a,
@@ -42,6 +46,7 @@ where
 
 pub(crate) trait IntoFixedLengthByteIterator<const N: usize> {
     type IntoIter: FixedLengthIterator<'static, u8, N>;
+    #[allow(dead_code)]
     fn into_le_iter(self) -> Self::IntoIter;
     fn into_be_iter(self) -> Self::IntoIter;
 }

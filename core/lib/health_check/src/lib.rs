@@ -12,10 +12,10 @@ use futures::future;
 use serde::Serialize;
 use tokio::sync::watch;
 
-use self::metrics::METRICS;
-use crate::metrics::CheckResult;
+use crate::metrics::{AppHealthCheckConfig, CheckResult, METRICS};
 
 mod metrics;
+
 #[cfg(test)]
 mod tests;
 
@@ -79,6 +79,11 @@ impl Health {
     pub fn status(&self) -> HealthStatus {
         self.status
     }
+
+    /// Returns health details. Mostly useful for testing.
+    pub fn details(&self) -> Option<&serde_json::Value> {
+        self.details.as_ref()
+    }
 }
 
 impl From<HealthStatus> for Health {
@@ -90,10 +95,25 @@ impl From<HealthStatus> for Health {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum AppHealthCheckError {
+    /// Component is redefined.
+    #[error("cannot insert health check for component `{0}`: it is redefined")]
+    RedefinedComponent(&'static str),
+}
+
 /// Application health check aggregating health from multiple components.
 #[derive(Debug)]
 pub struct AppHealthCheck {
-    components: Mutex<Vec<Arc<dyn CheckHealth>>>,
+    inner: Mutex<AppHealthCheckInner>,
+}
+
+#[derive(Debug, Clone)]
+struct AppHealthCheckInner {
+    /// Application-level health details.
+    app_details: Option<serde_json::Value>,
+    components: Vec<Arc<dyn CheckHealth>>,
     slow_time_limit: Duration,
     hard_time_limit: Duration,
 }
@@ -105,56 +125,119 @@ impl Default for AppHealthCheck {
 }
 
 impl AppHealthCheck {
-    pub fn new(slow_time_limit: Option<Duration>, hard_time_limit: Option<Duration>) -> Self {
-        const DEFAULT_SLOW_TIME_LIMIT: Duration = Duration::from_millis(500);
-        const DEFAULT_HARD_TIME_LIMIT: Duration = Duration::from_secs(3);
+    const DEFAULT_SLOW_TIME_LIMIT: Duration = Duration::from_millis(500);
+    const DEFAULT_HARD_TIME_LIMIT: Duration = Duration::from_secs(3);
 
-        let slow_time_limit = slow_time_limit.unwrap_or(DEFAULT_SLOW_TIME_LIMIT);
-        let hard_time_limit = hard_time_limit.unwrap_or(DEFAULT_HARD_TIME_LIMIT);
+    pub fn new(slow_time_limit: Option<Duration>, hard_time_limit: Option<Duration>) -> Self {
+        let slow_time_limit = slow_time_limit.unwrap_or(Self::DEFAULT_SLOW_TIME_LIMIT);
+        let hard_time_limit = hard_time_limit.unwrap_or(Self::DEFAULT_HARD_TIME_LIMIT);
         tracing::debug!("Created app health with time limits: slow={slow_time_limit:?}, hard={hard_time_limit:?}");
-        Self {
-            components: Mutex::default(),
+
+        let inner = AppHealthCheckInner {
+            components: Vec::default(),
+            app_details: None,
             slow_time_limit,
             hard_time_limit,
+        };
+        Self {
+            inner: Mutex::new(inner),
         }
+    }
+
+    pub fn override_limits(
+        &self,
+        slow_time_limit: Option<Duration>,
+        hard_time_limit: Option<Duration>,
+    ) {
+        let mut guard = self.inner.lock().expect("`AppHealthCheck` is poisoned");
+        if let Some(slow_time_limit) = slow_time_limit {
+            guard.slow_time_limit = slow_time_limit;
+        }
+        if let Some(hard_time_limit) = hard_time_limit {
+            guard.hard_time_limit = hard_time_limit;
+        }
+        tracing::debug!(
+            "Overridden app health time limits: slow={:?}, hard={:?}",
+            guard.slow_time_limit,
+            guard.hard_time_limit
+        );
+    }
+
+    /// Sets the info metrics for the metrics time limits.
+    /// This method should be called at most once when all the health checks are collected.
+    pub fn expose_metrics(&self) {
+        let config = {
+            let inner = self.inner.lock().expect("`AppHealthCheck` is poisoned");
+            AppHealthCheckConfig {
+                slow_time_limit: inner.slow_time_limit.into(),
+                hard_time_limit: inner.hard_time_limit.into(),
+            }
+        };
+        if METRICS.info.set(config).is_err() {
+            tracing::warn!(
+                "App health redefined; previous config: {:?}",
+                METRICS.info.get()
+            );
+        }
+    }
+
+    /// Sets app-level health details. They can include build info etc.
+    pub fn set_details(&self, details: impl Serialize) {
+        let details = serde_json::to_value(details).expect("failed serializing app details");
+        let mut inner = self.inner.lock().expect("`AppHealthCheck` is poisoned");
+        inner.app_details = Some(details);
     }
 
     /// Inserts health check for a component.
-    pub fn insert_component(&self, health_check: ReactiveHealthCheck) {
-        self.insert_custom_component(Arc::new(health_check));
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the component with the same name is already defined.
+    pub fn insert_component(
+        &self,
+        health_check: ReactiveHealthCheck,
+    ) -> Result<(), AppHealthCheckError> {
+        self.insert_custom_component(Arc::new(health_check))
     }
 
     /// Inserts a custom health check for a component.
-    pub fn insert_custom_component(&self, health_check: Arc<dyn CheckHealth>) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the component with the same name is already defined.
+    pub fn insert_custom_component(
+        &self,
+        health_check: Arc<dyn CheckHealth>,
+    ) -> Result<(), AppHealthCheckError> {
         let health_check_name = health_check.name();
-        let mut guard = self
+        let mut guard = self.inner.lock().expect("`AppHealthCheck` is poisoned");
+        if guard
             .components
-            .lock()
-            .expect("`AppHealthCheck` is poisoned");
-        if guard.iter().any(|check| check.name() == health_check_name) {
-            tracing::warn!(
-                "Health check with name `{health_check_name}` is redefined; only the last mention \
-                 will be present in `/health` endpoint output"
-            );
+            .iter()
+            .any(|check| check.name() == health_check_name)
+        {
+            return Err(AppHealthCheckError::RedefinedComponent(health_check_name));
         }
-        guard.push(health_check);
+        guard.components.push(health_check);
+        Ok(())
     }
 
     /// Checks the overall application health. This will query all component checks concurrently.
     pub async fn check_health(&self) -> AppHealth {
-        // Clone checks so that we don't hold a lock for them across a wait point.
-        let health_checks = self
-            .components
+        // Clone `inner` so that we don't hold a lock for them across a wait point.
+        let AppHealthCheckInner {
+            components,
+            app_details,
+            slow_time_limit,
+            hard_time_limit,
+        } = self
+            .inner
             .lock()
             .expect("`AppHealthCheck` is poisoned")
             .clone();
 
-        let check_futures = health_checks.iter().map(|check| {
-            Self::check_health_with_time_limit(
-                check.as_ref(),
-                self.slow_time_limit,
-                self.hard_time_limit,
-            )
+        let check_futures = components.iter().map(|check| {
+            Self::check_health_with_time_limit(check.as_ref(), slow_time_limit, hard_time_limit)
         });
         let components: HashMap<_, _> = future::join_all(check_futures).await.into_iter().collect();
 
@@ -163,7 +246,8 @@ impl AppHealthCheck {
             .map(|health| health.status)
             .max_by_key(|status| status.priority_for_aggregation())
             .unwrap_or(HealthStatus::Ready);
-        let inner = aggregated_status.into();
+        let mut inner = Health::from(aggregated_status);
+        inner.details = app_details.clone();
 
         let health = AppHealth { inner, components };
         if !health.inner.status.is_healthy() {
@@ -251,6 +335,16 @@ impl AppHealth {
     pub fn is_healthy(&self) -> bool {
         self.inner.status.is_healthy()
     }
+
+    /// Returns a reference to the overall health of the application.
+    pub fn inner(&self) -> &Health {
+        &self.inner
+    }
+
+    /// Returns a reference to the component information.
+    pub fn components(&self) -> &HashMap<&'static str, Health> {
+        &self.components
+    }
 }
 
 /// Interface to be used for health checks.
@@ -268,6 +362,17 @@ impl fmt::Debug for dyn CheckHealth {
             .debug_struct("CheckHealth")
             .field("name", &self.name())
             .finish()
+    }
+}
+
+#[async_trait]
+impl<T: CheckHealth + ?Sized> CheckHealth for Arc<T> {
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+
+    async fn check_health(&self) -> Health {
+        (**self).check_health().await
     }
 }
 
@@ -293,6 +398,17 @@ impl ReactiveHealthCheck {
             health_sender,
         };
         (this, updater)
+    }
+
+    /// Waits until the specified `condition` is true for the tracked [`Health`], and returns health.
+    /// Mostly useful for testing.
+    ///
+    /// If the health updater associated with this check is dropped, this method can wait indefinitely.
+    pub async fn wait_for(&mut self, condition: impl FnMut(&Health) -> bool) -> Health {
+        match self.health_receiver.wait_for(condition).await {
+            Ok(health) => health.clone(),
+            Err(_) => future::pending().await,
+        }
     }
 }
 

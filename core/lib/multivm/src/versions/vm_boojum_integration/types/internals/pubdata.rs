@@ -1,7 +1,6 @@
-use zksync_types::{
-    event::L1MessengerL2ToL1Log,
-    writes::{compress_state_diffs, StateDiffRecord},
-};
+use zksync_types::writes::{compress_state_diffs, StateDiffRecord};
+
+use crate::interface::pubdata::L1MessengerL2ToL1Log;
 
 /// Struct based on which the pubdata blob is formed
 #[derive(Debug, Clone, Default)]
@@ -65,7 +64,7 @@ impl PubdataInput {
 #[cfg(test)]
 mod tests {
     use zksync_system_constants::{ACCOUNT_CODE_STORAGE_ADDRESS, BOOTLOADER_ADDRESS};
-    use zksync_utils::u256_to_h256;
+    use zksync_types::u256_to_h256;
 
     use super::*;
 

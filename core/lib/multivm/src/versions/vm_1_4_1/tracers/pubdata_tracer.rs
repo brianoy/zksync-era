@@ -1,27 +1,30 @@
 use std::marker::PhantomData;
 
+use circuit_sequencer_api::sort_storage_access::sort_storage_access_queries;
 use zk_evm_1_4_1::{
     aux_structures::Timestamp,
     tracing::{BeforeExecutionData, VmLocalStateData},
 };
-use zkevm_test_harness_1_4_1::witness::sort_storage_access::sort_storage_access_queries;
-use zksync_state::{StoragePtr, WriteStorage};
 use zksync_types::{
-    event::{
-        extract_bytecode_publication_requests_from_l1_messenger,
-        extract_l2tol1logs_from_l1_messenger, extract_long_l2_to_l1_messages, L1MessengerL2ToL1Log,
-    },
-    writes::StateDiffRecord,
-    AccountTreeId, StorageKey, L1_MESSENGER_ADDRESS,
+    h256_to_u256, u256_to_h256, writes::StateDiffRecord, AccountTreeId, StorageKey,
+    L1_MESSENGER_ADDRESS,
 };
-use zksync_utils::{h256_to_u256, u256_to_bytes_be, u256_to_h256};
 
 use crate::{
     interface::{
-        dyn_tracers::vm_1_4_1::DynTracer,
+        pubdata::L1MessengerL2ToL1Log,
+        storage::{StoragePtr, WriteStorage},
         tracer::{TracerExecutionStatus, TracerExecutionStopReason},
-        types::inputs::L1BatchEnv,
-        VmExecutionMode,
+        L1BatchEnv, VmEvent, VmExecutionMode,
+    },
+    tracers::dynamic::vm_1_4_1::DynTracer,
+    utils::{
+        bytecode::be_words_to_bytes,
+        events::{
+            extract_bytecode_publication_requests_from_l1_messenger,
+            extract_l2tol1logs_from_l1_messenger,
+        },
+        glue_log_query,
     },
     vm_1_4_1::{
         bootloader_state::{utils::apply_pubdata_to_memory, BootloaderState},
@@ -82,8 +85,7 @@ impl<S: WriteStorage> PubdataTracer<S> {
             &self.l1_batch_env,
             Timestamp(0),
         );
-
-        extract_long_l2_to_l1_messages(&all_generated_events)
+        VmEvent::extract_long_l2_to_l1_messages(&all_generated_events)
     }
 
     // Packs part of L1 Messenger total pubdata that corresponds to
@@ -104,15 +106,13 @@ impl<S: WriteStorage> PubdataTracer<S> {
         bytecode_publication_requests
             .iter()
             .map(|bytecode_publication_request| {
-                state
+                let bytecode_words = state
                     .decommittment_processor
                     .known_bytecodes
                     .inner()
                     .get(&h256_to_u256(bytecode_publication_request.bytecode_hash))
-                    .unwrap()
-                    .iter()
-                    .flat_map(u256_to_bytes_be)
-                    .collect()
+                    .unwrap();
+                be_words_to_bytes(bytecode_words)
             })
             .collect()
     }
@@ -131,7 +131,7 @@ impl<S: WriteStorage> PubdataTracer<S> {
             storage
                 .storage_log_queries_after_timestamp(Timestamp(0))
                 .iter()
-                .map(|log| &log.log_query),
+                .map(|log| glue_log_query(log.log_query)),
         )
         .1
         .into_iter()

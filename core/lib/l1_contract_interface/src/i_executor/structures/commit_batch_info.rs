@@ -1,12 +1,12 @@
-use std::borrow::Cow;
-
 use zksync_types::{
-    commitment::{pre_boojum_serialize_commitments, serialize_commitments, L1BatchWithMetadata},
-    ethabi,
-    ethabi::Token,
-    pubdata_da::PubdataDA,
-    web3::{contract::Error as Web3ContractError, error::Error as Web3ApiError},
-    ProtocolVersionId, U256,
+    commitment::{
+        pre_boojum_serialize_commitments, serialize_commitments, L1BatchCommitmentMode,
+        L1BatchWithMetadata,
+    },
+    ethabi::{ParamType, Token},
+    pubdata_da::PubdataSendingMode,
+    web3::{contract::Error as ContractError, keccak256},
+    ProtocolVersionId, H256, U256,
 };
 
 use crate::{
@@ -15,22 +15,44 @@ use crate::{
 };
 
 /// These are used by the L1 Contracts to indicate what DA layer is used for pubdata
-const PUBDATA_SOURCE_CALLDATA: u8 = 0;
-const PUBDATA_SOURCE_BLOBS: u8 = 1;
+pub const PUBDATA_SOURCE_CALLDATA: u8 = 0;
+pub const PUBDATA_SOURCE_BLOBS: u8 = 1;
+pub const PUBDATA_SOURCE_CUSTOM_PRE_GATEWAY: u8 = 2;
 
-/// Encoding for `CommitBatchInfo` from `IExecutor.sol`
+/// Encoding for `CommitBatchInfo` from `IExecutor.sol` for a contract running in rollup mode.
 #[derive(Debug)]
 pub struct CommitBatchInfo<'a> {
-    pub l1_batch_with_metadata: &'a L1BatchWithMetadata,
-    pub pubdata_da: PubdataDA,
+    mode: L1BatchCommitmentMode,
+    l1_batch_with_metadata: &'a L1BatchWithMetadata,
+    pubdata_da: PubdataSendingMode,
 }
 
 impl<'a> CommitBatchInfo<'a> {
-    pub fn new(l1_batch_with_metadata: &'a L1BatchWithMetadata, pubdata_da: PubdataDA) -> Self {
+    pub fn new(
+        mode: L1BatchCommitmentMode,
+        l1_batch_with_metadata: &'a L1BatchWithMetadata,
+        pubdata_da: PubdataSendingMode,
+    ) -> Self {
         Self {
+            mode,
             l1_batch_with_metadata,
             pubdata_da,
         }
+    }
+
+    pub fn post_gateway_schema() -> ParamType {
+        ParamType::Tuple(vec![
+            ParamType::Uint(64),       // `batch_number`
+            ParamType::Uint(64),       // `timestamp`
+            ParamType::Uint(64),       // `index_repeated_storage_changes`
+            ParamType::FixedBytes(32), // `new_state_root`
+            ParamType::Uint(256),      // `numberOfLayer1Txs`
+            ParamType::FixedBytes(32), // `priorityOperationsHash`
+            ParamType::FixedBytes(32), // `bootloaderHeapInitialContentsHash`
+            ParamType::FixedBytes(32), // `eventsQueueStateHash`
+            ParamType::Bytes,          // `systemLogs`
+            ParamType::Bytes,          // `operatorDAInput`
+        ])
     }
 
     fn base_tokens(&self) -> Vec<Token> {
@@ -50,7 +72,7 @@ impl<'a> CommitBatchInfo<'a> {
                 Token::FixedBytes(
                     self.l1_batch_with_metadata
                         .metadata
-                        .merkle_root_hash
+                        .root_hash
                         .as_bytes()
                         .to_vec(),
                 ),
@@ -116,7 +138,7 @@ impl<'a> CommitBatchInfo<'a> {
                 Token::FixedBytes(
                     self.l1_batch_with_metadata
                         .metadata
-                        .merkle_root_hash
+                        .root_hash
                         .as_bytes()
                         .to_vec(),
                 ),
@@ -165,66 +187,12 @@ impl<'a> CommitBatchInfo<'a> {
     }
 }
 
-impl CommitBatchInfo<'static> {
-    /// Determines which DA source was used in the `reference` commitment. It's assumed that the commitment was created
-    /// using `CommitBatchInfo::into_token()`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `reference` is malformed.
-    pub fn detect_da(
-        protocol_version: ProtocolVersionId,
-        reference: &Token,
-    ) -> Result<PubdataDA, Web3ContractError> {
-        fn parse_error(message: impl Into<Cow<'static, str>>) -> Web3ContractError {
-            Web3ContractError::Abi(ethabi::Error::Other(message.into()))
-        }
-
-        if protocol_version.is_pre_1_4_2() {
-            return Ok(PubdataDA::Calldata);
-        }
-
-        let reference = match reference {
-            Token::Tuple(tuple) => tuple,
-            _ => {
-                return Err(parse_error(format!(
-                    "reference has unexpected shape; expected a tuple, got {reference:?}"
-                )))
-            }
-        };
-        let Some(last_reference_token) = reference.last() else {
-            return Err(parse_error("reference commitment data is empty"));
-        };
-
-        let last_reference_token = match last_reference_token {
-            Token::Bytes(bytes) => bytes,
-            _ => return Err(parse_error(format!(
-                "last reference token has unexpected shape; expected bytes, got {last_reference_token:?}"
-            ))),
-        };
-        match last_reference_token.first() {
-            Some(&byte) if byte == PUBDATA_SOURCE_CALLDATA => Ok(PubdataDA::Calldata),
-            Some(&byte) if byte == PUBDATA_SOURCE_BLOBS => Ok(PubdataDA::Blobs),
-            Some(&byte) => Err(parse_error(format!(
-                "unexpected first byte of the last reference token; expected one of [{PUBDATA_SOURCE_CALLDATA}, {PUBDATA_SOURCE_BLOBS}], \
-                 got {byte}"
-            ))),
-            None => Err(parse_error("last reference token is empty")),
-        }
-    }
-}
-
-impl<'a> Tokenizable for CommitBatchInfo<'a> {
-    fn from_token(_token: Token) -> Result<Self, Web3ContractError>
-    where
-        Self: Sized,
-    {
+impl Tokenizable for CommitBatchInfo<'_> {
+    fn from_token(_token: Token) -> Result<Self, ContractError> {
         // Currently there is no need to decode this struct.
         // We still want to implement `Tokenizable` trait for it, so that *once* it's needed
         // the implementation is provided here and not in some other inconsistent way.
-        Err(Web3ContractError::Api(Web3ApiError::Decoder(
-            "Not implemented".to_string(),
-        )))
+        Err(ContractError::Other("Not implemented".into()))
     }
 
     fn into_token(self) -> Token {
@@ -241,40 +209,202 @@ impl<'a> Tokenizable for CommitBatchInfo<'a> {
         }
 
         if protocol_version.is_pre_1_4_2() {
-            tokens.push(
-                // `totalL2ToL1Pubdata` without pubdata source byte
-                Token::Bytes(self.pubdata_input()),
-            );
-        } else {
-            let pubdata = self.pubdata_input();
-            match self.pubdata_da {
-                PubdataDA::Calldata => {
+            tokens.push(Token::Bytes(match self.mode {
+                L1BatchCommitmentMode::Rollup => self.pubdata_input(),
+                // Here we're not pushing any pubdata on purpose; no pubdata is sent in Validium mode.
+                L1BatchCommitmentMode::Validium => vec![],
+            }));
+        } else if protocol_version.is_pre_gateway() {
+            tokens.push(Token::Bytes(match (self.mode, self.pubdata_da) {
+                // Here we're not pushing any pubdata on purpose; no pubdata is sent in Validium mode.
+                (
+                    L1BatchCommitmentMode::Validium,
+                    PubdataSendingMode::Calldata | PubdataSendingMode::RelayedL2Calldata,
+                ) => {
+                    vec![PUBDATA_SOURCE_CALLDATA]
+                }
+                (L1BatchCommitmentMode::Validium, PubdataSendingMode::Blobs) => {
+                    vec![PUBDATA_SOURCE_BLOBS]
+                }
+                (L1BatchCommitmentMode::Rollup, PubdataSendingMode::Custom) => {
+                    panic!("Custom pubdata DA is incompatible with Rollup mode")
+                }
+                (L1BatchCommitmentMode::Validium, PubdataSendingMode::Custom) => {
+                    vec![PUBDATA_SOURCE_CUSTOM_PRE_GATEWAY]
+                }
+                (
+                    L1BatchCommitmentMode::Rollup,
+                    PubdataSendingMode::Calldata | PubdataSendingMode::RelayedL2Calldata,
+                ) => {
                     // We compute and add the blob commitment to the pubdata payload so that we can verify the proof
                     // even if we are not using blobs.
+                    let pubdata = self.pubdata_input();
                     let blob_commitment = KzgInfo::new(&pubdata).to_blob_commitment();
-
-                    let result = std::iter::once(PUBDATA_SOURCE_CALLDATA)
+                    [PUBDATA_SOURCE_CALLDATA]
+                        .into_iter()
                         .chain(pubdata)
                         .chain(blob_commitment)
-                        .collect();
-
-                    tokens.push(Token::Bytes(result));
+                        .collect()
                 }
-                PubdataDA::Blobs => {
+                (L1BatchCommitmentMode::Rollup, PubdataSendingMode::Blobs) => {
+                    let pubdata = self.pubdata_input();
                     let pubdata_commitments =
                         pubdata.chunks(ZK_SYNC_BYTES_PER_BLOB).flat_map(|blob| {
                             let kzg_info = KzgInfo::new(blob);
                             kzg_info.to_pubdata_commitment()
                         });
-                    let result = std::iter::once(PUBDATA_SOURCE_BLOBS)
+                    [PUBDATA_SOURCE_BLOBS]
+                        .into_iter()
                         .chain(pubdata_commitments)
-                        .collect();
-
-                    tokens.push(Token::Bytes(result));
+                        .collect()
                 }
-            }
+            }));
+        } else {
+            let state_diff_hash = self
+                .l1_batch_with_metadata
+                .metadata
+                .state_diff_hash
+                .expect("Failed to get state_diff_hash from metadata");
+            tokens.push(Token::Bytes(match (self.mode, self.pubdata_da) {
+                // Validiums with custom DA need the inclusion data to be part of operator_da_input
+                (L1BatchCommitmentMode::Validium, PubdataSendingMode::Custom) => {
+                    let mut operator_da_input: Vec<u8> = state_diff_hash.0.into();
+
+                    operator_da_input.extend(
+                        &self
+                            .l1_batch_with_metadata
+                            .metadata
+                            .da_inclusion_data
+                            .clone()
+                            .unwrap_or_default(),
+                    );
+
+                    operator_da_input
+                }
+                // Here we're not pushing any pubdata on purpose; no pubdata is sent in Validium mode.
+                (
+                    L1BatchCommitmentMode::Validium,
+                    PubdataSendingMode::Calldata
+                    | PubdataSendingMode::RelayedL2Calldata
+                    | PubdataSendingMode::Blobs,
+                ) => state_diff_hash.0.into(),
+                (L1BatchCommitmentMode::Rollup, PubdataSendingMode::Custom) => {
+                    panic!("Custom pubdata DA is incompatible with Rollup mode")
+                }
+                (L1BatchCommitmentMode::Rollup, PubdataSendingMode::Calldata) => {
+                    let pubdata = self.pubdata_input();
+
+                    let header =
+                        compose_header_for_l1_commit_rollup(state_diff_hash, pubdata.clone());
+
+                    // We compute and add the blob commitment to the pubdata payload so that we can verify the proof
+                    // even if we are not using blobs.
+                    let blob_commitment = KzgInfo::new(&pubdata).to_blob_commitment();
+                    header
+                        .into_iter()
+                        .chain([PUBDATA_SOURCE_CALLDATA])
+                        .chain(pubdata)
+                        .chain(blob_commitment)
+                        .collect()
+                }
+                (L1BatchCommitmentMode::Rollup, PubdataSendingMode::RelayedL2Calldata) => {
+                    let pubdata = self.pubdata_input();
+
+                    let header =
+                        compose_header_for_l1_commit_rollup(state_diff_hash, pubdata.clone());
+
+                    // We compute and add the blob commitment to the pubdata payload so that we can verify the proof
+                    // even if we are not using blobs.
+                    // Note, that the only difference from the `PubdataSendingMode::Calldata` is that mutliple
+                    // commitments can be provided as the size of a transaction on top of Gateway can exceed 120kb.
+                    let blob_commitments: Vec<u8> = if pubdata.is_empty() {
+                        // For consistency with `Calldata` sending mode we provide some non-empty commitments
+                        // even when pubdata is zero. Note, that this will never actually happen in production,
+                        // but this helps for easier testing.
+                        KzgInfo::new(&pubdata).to_blob_commitment().to_vec()
+                    } else {
+                        pubdata
+                            .chunks(ZK_SYNC_BYTES_PER_BLOB)
+                            .flat_map(|blob| {
+                                let blob_commitment = KzgInfo::new(blob).to_blob_commitment();
+
+                                // We also append 0s to show that we do not reuse previously published blobs.
+                                blob_commitment.into_iter().collect::<Vec<u8>>()
+                            })
+                            .collect()
+                    };
+
+                    header
+                        .into_iter()
+                        .chain([PUBDATA_SOURCE_CALLDATA])
+                        .chain(pubdata)
+                        .chain(blob_commitments)
+                        .collect()
+                }
+                (L1BatchCommitmentMode::Rollup, PubdataSendingMode::Blobs) => {
+                    let pubdata = self.pubdata_input();
+
+                    let header =
+                        compose_header_for_l1_commit_rollup(state_diff_hash, pubdata.clone());
+
+                    let pubdata_commitments: Vec<u8> = pubdata
+                        .chunks(ZK_SYNC_BYTES_PER_BLOB)
+                        .flat_map(|blob| {
+                            let kzg_info = KzgInfo::new(blob);
+
+                            let blob_commitment = kzg_info.to_pubdata_commitment();
+
+                            // We also append 0s to show that we do not reuse previously published blobs.
+                            blob_commitment
+                                .into_iter()
+                                .chain([0u8; 32])
+                                .collect::<Vec<u8>>()
+                        })
+                        .collect();
+                    header
+                        .into_iter()
+                        .chain([PUBDATA_SOURCE_BLOBS])
+                        .chain(pubdata_commitments)
+                        .collect()
+                }
+            }));
         }
 
         Token::Tuple(tokens)
     }
+}
+
+fn compose_header_for_l1_commit_rollup(state_diff_hash: H256, pubdata: Vec<u8>) -> Vec<u8> {
+    // The preimage under the hash `l2DAValidatorOutputHash` is expected to be in the following format:
+    // - First 32 bytes are the hash of the uncompressed state diff.
+    // - Then, there is a 32-byte hash of the full pubdata.
+    // - Then, there is the 1-byte number of blobs published.
+    // - Then, there are linear hashes of the published blobs, 32 bytes each.
+
+    let mut full_header = vec![];
+
+    full_header.extend(state_diff_hash.0);
+
+    let mut full_pubdata = pubdata;
+    let full_pubdata_hash = keccak256(&full_pubdata);
+    full_header.extend(full_pubdata_hash);
+
+    // Now, we need to calculate the linear hashes of the blobs.
+    // Firstly, let's pad the pubdata to the size of the blob.
+    if full_pubdata.len() % ZK_SYNC_BYTES_PER_BLOB != 0 {
+        full_pubdata.resize(
+            full_pubdata.len() + ZK_SYNC_BYTES_PER_BLOB
+                - full_pubdata.len() % ZK_SYNC_BYTES_PER_BLOB,
+            0,
+        );
+    }
+    full_header.push((full_pubdata.len() / ZK_SYNC_BYTES_PER_BLOB) as u8);
+
+    full_pubdata
+        .chunks(ZK_SYNC_BYTES_PER_BLOB)
+        .for_each(|chunk| {
+            full_header.extend(keccak256(chunk));
+        });
+
+    full_header
 }

@@ -3,7 +3,7 @@ use std::{
     marker::PhantomData,
 };
 
-use zk_evm_1_4_1::{
+use zk_evm_1_5_0::{
     aux_structures::Timestamp,
     tracing::{
         AfterDecodingData, AfterExecutionData, BeforeExecutionData, Tracer, VmLocalStateData,
@@ -12,40 +12,36 @@ use zk_evm_1_4_1::{
     witness_trace::DummyTracer,
     zkevm_opcode_defs::{decoding::EncodingModeProduction, Opcode, RetOpcode},
 };
-use zksync_state::{StoragePtr, WriteStorage};
 
-use super::PubdataTracer;
+use super::{EvmDeployTracer, PubdataTracer};
 use crate::{
     glue::GlueInto,
     interface::{
-        tracer::{TracerExecutionStopReason, VmExecutionStopReason},
-        traits::tracers::dyn_tracers::vm_1_4_1::DynTracer,
-        types::tracer::TracerExecutionStatus,
+        storage::{StoragePtr, WriteStorage},
+        tracer::{TracerExecutionStatus, TracerExecutionStopReason, VmExecutionStopReason},
         Halt, VmExecutionMode,
     },
+    tracers::dynamic::vm_1_5_0::DynTracer,
     vm_latest::{
-        bootloader_state::{utils::apply_l2_block, BootloaderState},
+        bootloader::{utils::apply_l2_block, BootloaderState},
         constants::BOOTLOADER_HEAP_PAGE,
         old_vm::{history_recorder::HistoryMode, memory::SimpleMemory},
         tracers::{
             dispatcher::TracerDispatcher,
-            utils::{
-                computational_gas_price, gas_spent_on_bytecodes_and_long_messages_this_opcode,
-                print_debug_if_needed, VmHook,
-            },
+            utils::{computational_gas_price, print_debug_log, print_debug_returndata},
             CircuitsTracer, RefundsTracer, ResultTracer,
         },
-        types::internals::ZkSyncVmState,
-        VmTracer,
+        types::ZkSyncVmState,
+        vm::MultiVmSubversion,
+        VmHook, VmTracer,
     },
 };
 
 /// Default tracer for the VM. It manages the other tracers execution and stop the vm when needed.
-pub(crate) struct DefaultExecutionTracer<S: WriteStorage, H: HistoryMode> {
+pub struct DefaultExecutionTracer<S: WriteStorage, H: HistoryMode> {
     tx_has_been_processed: bool,
     execution_mode: VmExecutionMode,
 
-    pub(crate) gas_spent_on_bytecodes_and_long_messages: u32,
     // Amount of gas used during account validation.
     pub(crate) computational_gas_used: u32,
     // Maximum number of gas that we're allowed to use during account validation.
@@ -67,34 +63,40 @@ pub(crate) struct DefaultExecutionTracer<S: WriteStorage, H: HistoryMode> {
     // It only takes into account circuits that are generated for actual execution. It doesn't
     // take into account e.g circuits produced by the initial bootloader memory commitment.
     pub(crate) circuits_tracer: CircuitsTracer<S, H>,
-
+    // This tracer is responsible for handling EVM deployments and providing the data to the code decommitter.
+    pub(crate) evm_deploy_tracer: Option<EvmDeployTracer<S>>,
+    subversion: MultiVmSubversion,
     storage: StoragePtr<S>,
     _phantom: PhantomData<H>,
 }
 
 impl<S: WriteStorage, H: HistoryMode> DefaultExecutionTracer<S, H> {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         computational_gas_limit: u32,
+        use_evm_emulator: bool,
         execution_mode: VmExecutionMode,
         dispatcher: TracerDispatcher<S, H>,
         storage: StoragePtr<S>,
         refund_tracer: Option<RefundsTracer<S>>,
         pubdata_tracer: Option<PubdataTracer<S>>,
+        subversion: MultiVmSubversion,
     ) -> Self {
         Self {
             tx_has_been_processed: false,
             execution_mode,
-            gas_spent_on_bytecodes_and_long_messages: 0,
             computational_gas_used: 0,
             tx_validation_gas_limit: computational_gas_limit,
             in_account_validation: false,
             final_batch_info_requested: false,
-            result_tracer: ResultTracer::new(execution_mode),
+            subversion,
+            result_tracer: ResultTracer::new(execution_mode, subversion),
             refund_tracer,
             dispatcher,
             pubdata_tracer,
             ret_from_the_bootloader: None,
             circuits_tracer: CircuitsTracer::new(),
+            evm_deploy_tracer: use_evm_emulator.then(EvmDeployTracer::new),
             storage,
             _phantom: PhantomData,
         }
@@ -108,20 +110,17 @@ impl<S: WriteStorage, H: HistoryMode> DefaultExecutionTracer<S, H> {
         self.computational_gas_used > self.tx_validation_gas_limit
     }
 
-    pub(crate) fn gas_spent_on_pubdata(&self, vm_local_state: &VmLocalState) -> u32 {
-        self.gas_spent_on_bytecodes_and_long_messages + vm_local_state.spent_pubdata_counter
-    }
-
     fn set_fictive_l2_block(
         &mut self,
         state: &mut ZkSyncVmState<S, H>,
         bootloader_state: &mut BootloaderState,
     ) {
         let current_timestamp = Timestamp(state.local_state.timestamp);
+        let subversion = bootloader_state.get_vm_subversion();
         let txs_index = bootloader_state.free_tx_index();
         let l2_block = bootloader_state.insert_fictive_l2_block();
         let mut memory = vec![];
-        apply_l2_block(&mut memory, l2_block, txs_index);
+        apply_l2_block(&mut memory, l2_block, txs_index, subversion);
         state.memory.populate_page(
             BOOTLOADER_HEAP_PAGE as usize,
             memory,
@@ -179,6 +178,9 @@ macro_rules! dispatch_tracers {
             tracer.$function($( $params ),*);
         }
         $self.circuits_tracer.$function($( $params ),*);
+        if let Some(tracer) = &mut $self.evm_deploy_tracer {
+            tracer.$function($( $params ),*);
+        }
     };
 }
 
@@ -217,19 +219,21 @@ impl<S: WriteStorage, H: HistoryMode> Tracer for DefaultExecutionTracer<S, H> {
                 .saturating_add(computational_gas_price(state, &data));
         }
 
-        let hook = VmHook::from_opcode_memory(&state, &data);
-        print_debug_if_needed(&hook, &state, memory);
-
+        let hook = VmHook::from_opcode_memory(&state, &data, self.subversion);
         match hook {
-            VmHook::TxHasEnded => self.tx_has_been_processed = true,
-            VmHook::NoValidationEntered => self.in_account_validation = false,
-            VmHook::AccountValidationEntered => self.in_account_validation = true,
-            VmHook::FinalBatchInfo => self.final_batch_info_requested = true,
+            Some(VmHook::TxHasEnded) if matches!(self.execution_mode, VmExecutionMode::OneTx) => {
+                self.result_tracer.tx_finished_in_one_tx_mode = true;
+                self.tx_has_been_processed = true;
+            }
+            Some(VmHook::ValidationExited) => self.in_account_validation = false,
+            Some(VmHook::AccountValidationEntered) => self.in_account_validation = true,
+            Some(VmHook::FinalBatchInfo) => self.final_batch_info_requested = true,
+            Some(VmHook::DebugLog) => print_debug_log(&state, memory, self.subversion),
+            Some(VmHook::DebugReturnData) => {
+                print_debug_returndata(memory, self.result_tracer.get_latest_result_ptr())
+            }
             _ => {}
         }
-
-        self.gas_spent_on_bytecodes_and_long_messages +=
-            gas_spent_on_bytecodes_and_long_messages_this_opcode(&state, &data);
 
         dispatch_tracers!(self.before_execution(state, data, memory, self.storage.clone()));
     }
@@ -241,7 +245,7 @@ impl<S: WriteStorage, H: HistoryMode> Tracer for DefaultExecutionTracer<S, H> {
         memory: &Self::SupportedMemory,
     ) {
         if let VmExecutionMode::Bootloader = self.execution_mode {
-            let (next_opcode, _, _) = zk_evm_1_4_1::vm_state::read_and_decode(
+            let (next_opcode, _, _) = zk_evm_1_5_0::vm_state::read_and_decode(
                 state.vm_local_state,
                 memory,
                 &mut DummyTracer,
@@ -292,6 +296,12 @@ impl<S: WriteStorage, H: HistoryMode> DefaultExecutionTracer<S, H> {
             .circuits_tracer
             .finish_cycle(state, bootloader_state)
             .stricter(&result);
+
+        if let Some(evm_deploy_tracer) = &mut self.evm_deploy_tracer {
+            result = evm_deploy_tracer
+                .finish_cycle(state, bootloader_state)
+                .stricter(&result);
+        }
 
         result.stricter(&self.should_stop_execution())
     }

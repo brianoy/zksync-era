@@ -2,7 +2,7 @@ use anyhow::Context as _;
 use zksync_config::configs::object_store::{ObjectStoreConfig, ObjectStoreMode};
 use zksync_protobuf::{repr::ProtoRepr, required};
 
-use crate::proto;
+use crate::proto::object_store as proto;
 
 impl ProtoRepr for proto::ObjectStore {
     type Type = ObjectStoreConfig;
@@ -32,6 +32,27 @@ impl ProtoRepr for proto::ObjectStore {
                         .clone(),
                 }
             }
+            proto::object_store::Mode::S3WithCredentialFile(mode) => {
+                ObjectStoreMode::S3WithCredentialFile {
+                    bucket_base_url: required(&mode.bucket_base_url)
+                        .context("bucket_base_url")?
+                        .clone(),
+                    s3_credential_file_path: required(&mode.s3_credential_file_path)
+                        .context("s3_credential_file_path")?
+                        .clone(),
+                    endpoint: mode.endpoint.clone(),
+                    region: mode.region.clone(),
+                }
+            }
+            proto::object_store::Mode::S3AnonymousReadOnly(mode) => {
+                ObjectStoreMode::S3AnonymousReadOnly {
+                    bucket_base_url: required(&mode.bucket_base_url)
+                        .context("bucket_base_url")?
+                        .clone(),
+                    endpoint: mode.endpoint.clone(),
+                    region: mode.region.clone(),
+                }
+            }
             proto::object_store::Mode::FileBacked(mode) => ObjectStoreMode::FileBacked {
                 file_backed_base_path: required(&mode.file_backed_base_path)
                     .context("file_backed_base_path")?
@@ -44,6 +65,7 @@ impl ProtoRepr for proto::ObjectStore {
             max_retries: required(&self.max_retries)
                 .and_then(|x| Ok((*x).try_into()?))
                 .context("max_retries")?,
+            local_mirror_path: self.local_mirror_path.clone(),
         })
     }
 
@@ -70,6 +92,30 @@ impl ProtoRepr for proto::ObjectStore {
                     },
                 )
             }
+            ObjectStoreMode::S3WithCredentialFile {
+                bucket_base_url,
+                s3_credential_file_path,
+                endpoint,
+                region,
+            } => proto::object_store::Mode::S3WithCredentialFile(
+                proto::object_store::S3WithCredentialFile {
+                    bucket_base_url: Some(bucket_base_url.clone()),
+                    s3_credential_file_path: Some(s3_credential_file_path.clone()),
+                    endpoint: endpoint.clone(),
+                    region: region.clone(),
+                },
+            ),
+            ObjectStoreMode::S3AnonymousReadOnly {
+                bucket_base_url,
+                endpoint,
+                region,
+            } => proto::object_store::Mode::S3AnonymousReadOnly(
+                proto::object_store::S3AnonymousReadOnly {
+                    bucket_base_url: Some(bucket_base_url.clone()),
+                    endpoint: endpoint.clone(),
+                    region: region.clone(),
+                },
+            ),
             ObjectStoreMode::FileBacked {
                 file_backed_base_path,
             } => proto::object_store::Mode::FileBacked(proto::object_store::FileBacked {
@@ -80,6 +126,7 @@ impl ProtoRepr for proto::ObjectStore {
         Self {
             mode: Some(mode),
             max_retries: Some(this.max_retries.into()),
+            local_mirror_path: this.local_mirror_path.clone(),
         }
     }
 }

@@ -1,206 +1,153 @@
-use std::cell::RefCell;
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::Context as _;
-use futures::{channel::mpsc, executor::block_on, SinkExt, StreamExt};
-use prometheus_exporter::PrometheusExporterConfig;
+use clap::Parser;
 use tokio::sync::watch;
-use zksync_config::{
-    configs::{ObservabilityConfig, PrometheusConfig},
-    ApiConfig, ContractVerifierConfig, PostgresConfig,
-};
-use zksync_dal::ConnectionPool;
+use zksync_config::configs::{ContractVerifierSecrets, DatabaseSecrets, PrometheusConfig};
+use zksync_contract_verifier_lib::{etherscan::EtherscanVerifier, ContractVerifier};
+use zksync_core_leftovers::temp_config_store::{load_general_config, read_yaml_repr};
+use zksync_dal::{ConnectionPool, Core, CoreDal};
 use zksync_env_config::FromEnv;
+use zksync_protobuf_config::proto;
 use zksync_queued_job_processor::JobProcessor;
-use zksync_utils::wait_for_tasks::wait_for_tasks;
+use zksync_task_management::ManagedTasks;
+use zksync_types::secrets::APIKey;
+use zksync_vlog::prometheus::PrometheusExporterConfig;
 
-use crate::verifier::ContractVerifier;
-
-pub mod error;
-pub mod verifier;
-pub mod zksolc_utils;
-pub mod zkvyper_utils;
-
-async fn update_compiler_versions(connection_pool: &ConnectionPool) {
-    let mut storage = connection_pool.access_storage().await.unwrap();
-    let mut transaction = storage.start_transaction().await.unwrap();
-
-    let zksync_home = std::env::var("ZKSYNC_HOME").unwrap_or_else(|_| ".".into());
-
-    let zksolc_path = format!("{}/etc/zksolc-bin/", zksync_home);
-    let zksolc_versions: Vec<String> = std::fs::read_dir(zksolc_path)
-        .unwrap()
-        .filter_map(|file| {
-            let file = file.unwrap();
-            let Ok(file_type) = file.file_type() else {
-                return None;
-            };
-            if file_type.is_dir() {
-                file.file_name().into_string().ok()
-            } else {
-                None
-            }
-        })
-        .collect();
-    transaction
-        .contract_verification_dal()
-        .set_zksolc_versions(zksolc_versions)
-        .await
-        .unwrap();
-
-    let solc_path = format!("{}/etc/solc-bin/", zksync_home);
-    let solc_versions: Vec<String> = std::fs::read_dir(solc_path)
-        .unwrap()
-        .filter_map(|file| {
-            let file = file.unwrap();
-            let Ok(file_type) = file.file_type() else {
-                return None;
-            };
-            if file_type.is_dir() {
-                file.file_name().into_string().ok()
-            } else {
-                None
-            }
-        })
-        .collect();
-    transaction
-        .contract_verification_dal()
-        .set_solc_versions(solc_versions)
-        .await
-        .unwrap();
-
-    let zkvyper_path = format!("{}/etc/zkvyper-bin/", zksync_home);
-    let zkvyper_versions: Vec<String> = std::fs::read_dir(zkvyper_path)
-        .unwrap()
-        .filter_map(|file| {
-            let file = file.unwrap();
-            let Ok(file_type) = file.file_type() else {
-                return None;
-            };
-            if file_type.is_dir() {
-                file.file_name().into_string().ok()
-            } else {
-                None
-            }
-        })
-        .collect();
-    transaction
-        .contract_verification_dal()
-        .set_zkvyper_versions(zkvyper_versions)
-        .await
-        .unwrap();
-
-    let vyper_path = format!("{}/etc/vyper-bin/", zksync_home);
-    let vyper_versions: Vec<String> = std::fs::read_dir(vyper_path)
-        .unwrap()
-        .filter_map(|file| {
-            let file = file.unwrap();
-            let Ok(file_type) = file.file_type() else {
-                return None;
-            };
-            if file_type.is_dir() {
-                file.file_name().into_string().ok()
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    transaction
-        .contract_verification_dal()
-        .set_vyper_versions(vyper_versions)
-        .await
-        .unwrap();
-
-    transaction.commit().await.unwrap();
-}
-
-use structopt::StructOpt;
-
-#[derive(StructOpt)]
-#[structopt(name = "zkSync contract code verifier", author = "Matter Labs")]
+#[derive(Debug, Parser)]
+#[command(name = "ZKsync contract code verifier", author = "Matter Labs")]
 struct Opt {
     /// Number of jobs to process. If None, runs indefinitely.
-    #[structopt(long)]
+    #[arg(long)]
     jobs_number: Option<usize>,
+    /// Path to the configuration file.
+    #[arg(long)]
+    config_path: Option<PathBuf>,
+    /// Path to the secrets file.
+    #[arg(long)]
+    secrets_path: Option<PathBuf>,
+}
+
+async fn perform_storage_migration(pool: &ConnectionPool<Core>) -> anyhow::Result<()> {
+    const BATCH_SIZE: usize = 1000;
+
+    // Make it possible to override just in case.
+    let batch_size = std::env::var("CONTRACT_VERIFIER_MIGRATION_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(BATCH_SIZE);
+
+    let mut storage = pool.connection().await?;
+    let migration_performed = storage
+        .contract_verification_dal()
+        .is_verification_info_migration_performed()
+        .await?;
+    if !migration_performed {
+        tracing::info!(batch_size = %batch_size, "Running the storage migration for the contract verifier table");
+        storage
+            .contract_verification_dal()
+            .perform_verification_info_migration(batch_size)
+            .await?;
+    } else {
+        tracing::info!("Storage migration is not needed");
+    }
+    Ok(())
+}
+
+fn extract_secrets(
+    secrets_path: Option<&std::path::PathBuf>,
+) -> anyhow::Result<(DatabaseSecrets, Option<APIKey>)> {
+    let (database_secrets, contract_verifier_secrets) = if let Some(path) = secrets_path {
+        let secrets_config = read_yaml_repr::<proto::secrets::Secrets>(path)
+            .context("failed decoding secrets YAML config")?;
+        (
+            secrets_config
+                .database
+                .context("failed to parse database secrets")?,
+            secrets_config.contract_verifier,
+        )
+    } else {
+        let db_secrets = DatabaseSecrets::from_env().context("DatabaseSecrets::from_env()")?;
+        let contract_verifier_secrets = ContractVerifierSecrets::from_env().ok();
+        (db_secrets, contract_verifier_secrets)
+    };
+
+    let api_key = contract_verifier_secrets.and_then(|secrets| secrets.etherscan_api_key);
+
+    Ok((database_secrets, api_key))
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let opt = Opt::from_args();
+    let opt = Opt::parse();
 
-    let verifier_config = ContractVerifierConfig::from_env().context("ContractVerifierConfig")?;
+    let general_config = load_general_config(opt.config_path).context("general config")?;
+    let observability_config = general_config
+        .observability
+        .context("ObservabilityConfig")?;
+    let _observability_guard = observability_config.install()?;
+
+    let (database_secrets, etherscan_api_key) = extract_secrets(opt.secrets_path.as_ref())?;
+    let verifier_config = general_config
+        .contract_verifier
+        .context("ContractVerifierConfig")?;
     let prometheus_config = PrometheusConfig {
         listener_port: verifier_config.prometheus_port,
-        ..ApiConfig::from_env().context("ApiConfig")?.prometheus
+        ..general_config.api_config.context("ApiConfig")?.prometheus
     };
-    let postgres_config = PostgresConfig::from_env().context("PostgresConfig")?;
-    let pool = ConnectionPool::singleton(
-        postgres_config
+    let pool = ConnectionPool::<Core>::singleton(
+        database_secrets
             .master_url()
             .context("Master DB URL is absent")?,
     )
     .build()
-    .await
-    .unwrap();
+    .await?;
 
-    let observability_config =
-        ObservabilityConfig::from_env().context("ObservabilityConfig::from_env()")?;
-    let log_format: vlog::LogFormat = observability_config
-        .log_format
-        .parse()
-        .context("Invalid log format")?;
-    let mut builder = vlog::ObservabilityBuilder::new().with_log_format(log_format);
-    if let Some(sentry_url) = &observability_config.sentry_url {
-        builder = builder
-            .with_sentry_url(sentry_url)
-            .expect("Invalid Sentry URL")
-            .with_sentry_environment(observability_config.sentry_environment);
-    }
-    let _guard = builder.build();
-
-    // Report whether sentry is running after the logging subsystem was initialized.
-    if let Some(sentry_url) = observability_config.sentry_url {
-        tracing::info!("Sentry configured with URL: {sentry_url}");
-    } else {
-        tracing::info!("No sentry URL was provided");
-    }
+    perform_storage_migration(&pool).await?;
 
     let (stop_sender, stop_receiver) = watch::channel(false);
-    let (stop_signal_sender, mut stop_signal_receiver) = mpsc::channel(256);
-    {
-        let stop_signal_sender = RefCell::new(stop_signal_sender.clone());
-        ctrlc::set_handler(move || {
-            let mut sender = stop_signal_sender.borrow_mut();
-            block_on(sender.send(true)).expect("Ctrl+C signal send");
-        })
-        .expect("Error setting Ctrl+C handler");
-    }
+    let etherscan_verifier_enabled =
+        verifier_config.etherscan_api_url.is_some() && etherscan_api_key.is_some();
+    let contract_verifier = ContractVerifier::new(
+        verifier_config.compilation_timeout(),
+        pool.clone(),
+        etherscan_verifier_enabled,
+    )
+    .await
+    .context("failed initializing contract verifier")?;
+    let update_task = contract_verifier.sync_compiler_versions_task();
 
-    update_compiler_versions(&pool).await;
-
-    let contract_verifier = ContractVerifier::new(verifier_config, pool);
-    let tasks = vec![
-        // TODO PLA-335: Leftovers after the prover DB split.
-        // The prover connection pool is not used by the contract verifier, but we need to pass it
-        // since `JobProcessor` trait requires it.
+    let mut tasks = vec![
+        tokio::spawn(update_task),
         tokio::spawn(contract_verifier.run(stop_receiver.clone(), opt.jobs_number)),
         tokio::spawn(
-            PrometheusExporterConfig::pull(prometheus_config.listener_port).run(stop_receiver),
+            PrometheusExporterConfig::pull(prometheus_config.listener_port)
+                .run(stop_receiver.clone()),
         ),
     ];
+    if etherscan_verifier_enabled {
+        tracing::info!("Etherscan verifier is enabled");
+        let etherscan_verifier = EtherscanVerifier::new(
+            verifier_config.etherscan_api_url.unwrap(),
+            etherscan_api_key.unwrap(),
+            pool,
+            stop_receiver,
+        );
+        tasks.push(tokio::spawn(etherscan_verifier.run()));
+    } else {
+        tracing::info!("Etherscan verifier is disabled");
+    }
 
-    let particular_crypto_alerts = None;
-    let graceful_shutdown = None::<futures::future::Ready<()>>;
-    let tasks_allowed_to_finish = false;
+    let mut tasks = ManagedTasks::new(tasks);
     tokio::select! {
-        _ = wait_for_tasks(tasks, particular_crypto_alerts, graceful_shutdown, tasks_allowed_to_finish) => {},
-        _ = stop_signal_receiver.next() => {
+        () = tasks.wait_single() => {},
+        _ = tokio::signal::ctrl_c() => {
             tracing::info!("Stop signal received, shutting down");
         },
     };
-    let _ = stop_sender.send(true);
+    stop_sender.send_replace(true);
 
     // Sleep for some time to let verifier gracefully stop.
-    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+    tasks.complete(Duration::from_secs(5)).await;
     Ok(())
 }

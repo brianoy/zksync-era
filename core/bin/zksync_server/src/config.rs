@@ -1,17 +1,25 @@
 use anyhow::Context as _;
-use zksync_consensus_roles::{node, validator};
-use zksync_core::consensus;
+use zksync_config::configs::consensus::{ConsensusConfig, ConsensusSecrets};
+use zksync_core_leftovers::temp_config_store::read_yaml_repr;
+use zksync_protobuf_config::proto;
 
-pub(crate) fn read_consensus_config() -> anyhow::Result<consensus::MainNodeConfig> {
-    let path = std::env::var("CONSENSUS_CONFIG_PATH").context("CONSENSUS_CONFIG_PATH")?;
-    let cfg = std::fs::read_to_string(&path).context(path)?;
-    let cfg: consensus::config::Config =
-        consensus::config::decode_json(&cfg).context("failed decoding JSON")?;
-    let validator_key: validator::SecretKey =
-        consensus::config::read_secret("CONSENSUS_VALIDATOR_KEY")?;
-    let node_key: node::SecretKey = consensus::config::read_secret("CONSENSUS_NODE_KEY")?;
-    Ok(consensus::MainNodeConfig {
-        executor: cfg.executor_config(node_key),
-        validator: cfg.validator_config(validator_key),
-    })
+pub(crate) fn read_consensus_secrets() -> anyhow::Result<Option<ConsensusSecrets>> {
+    // Read public config.
+    let Ok(path) = std::env::var("CONSENSUS_SECRETS_PATH") else {
+        return Ok(None);
+    };
+    Ok(Some(
+        read_yaml_repr::<proto::secrets::ConsensusSecrets>(&path.into())
+            .context("failed decoding YAML")?,
+    ))
+}
+
+pub(crate) fn read_consensus_config() -> anyhow::Result<Option<ConsensusConfig>> {
+    // Read public config.
+    let Ok(path) = std::env::var("CONSENSUS_CONFIG_PATH") else {
+        return Ok(None);
+    };
+    Ok(Some(
+        read_yaml_repr::<proto::consensus::Config>(&path.into()).context("failed decoding YAML")?,
+    ))
 }

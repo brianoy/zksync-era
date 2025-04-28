@@ -11,14 +11,13 @@ use zk_evm_1_3_1::{
 };
 use zksync_types::{
     l2_to_l1_log::{L2ToL1Log, UserL2ToL1Log},
-    tx::tx_execution_info::TxExecutionStatus,
-    vm_trace::VmExecutionTrace,
-    L1BatchNumber, VmEvent, U256,
+    L1BatchNumber, U256,
 };
 
 use crate::{
     glue::GlueInto,
-    interface::types::outputs::VmExecutionLogs,
+    interface::{TxExecutionStatus, VmEvent, VmExecutionLogs},
+    versions::shared::VmExecutionTrace,
     vm_m5::{
         bootloader_state::BootloaderState,
         errors::{TxRevertReason, VmRevertReason, VmRevertReasonParsingResult},
@@ -82,7 +81,7 @@ pub(crate) fn get_vm_hook_params(memory: &SimpleMemory) -> Vec<U256> {
 ///
 /// This enum allows to execute blocks with the same VM but different support for refunds.
 #[derive(Debug, Copy, Clone)]
-pub enum MultiVMSubversion {
+pub enum MultiVmSubversion {
     /// Initial VM M5 version, refunds are fully disabled.
     V1,
     /// Refunds were enabled. ETH balance for bootloader address was marked as a free slot.
@@ -100,7 +99,7 @@ pub struct VmInstance<S: Storage> {
     pub snapshots: Vec<VmSnapshot>,
 
     /// MultiVM-specific addition. See enum doc-comment for details.
-    pub(crate) refund_state: MultiVMSubversion,
+    pub(crate) refund_state: MultiVmSubversion,
 }
 
 /// This structure stores data that accumulates during the VM run.
@@ -158,6 +157,7 @@ pub struct VmPartialExecutionResult {
     pub revert_reason: Option<TxRevertReason>,
     pub contracts_used: usize,
     pub cycles_used: u32,
+    pub gas_remaining: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -560,12 +560,12 @@ impl<S: Storage> VmInstance<S> {
                 let refund_to_propose;
                 let refund_slot;
                 match self.refund_state {
-                    MultiVMSubversion::V1 => {
+                    MultiVmSubversion::V1 => {
                         refund_to_propose = bootloader_refund;
                         refund_slot =
                             OPERATOR_REFUNDS_OFFSET + self.bootloader_state.tx_to_execute() - 1;
                     }
-                    MultiVMSubversion::V2 => {
+                    MultiVmSubversion::V2 => {
                         let gas_spent_on_pubdata = tracer
                             .gas_spent_on_pubdata(&self.state.local_state)
                             - spent_pubdata_counter_before;
@@ -683,6 +683,7 @@ impl<S: Storage> VmInstance<S> {
                                 .get_decommitted_bytes_after_timestamp(timestamp_initial),
                             cycles_used: self.state.local_state.monotonic_cycle_counter
                                 - cycles_initial,
+                            gas_remaining: self.gas_remaining(),
                         },
                     })
                 } else {
@@ -744,11 +745,12 @@ impl<S: Storage> VmInstance<S> {
                         .decommittment_processor
                         .get_decommitted_bytes_after_timestamp(timestamp_initial),
                     cycles_used: self.state.local_state.monotonic_cycle_counter - cycles_initial,
+                    gas_remaining: self.gas_remaining(),
                 };
 
                 // Collecting `block_tip_result` needs logs with timestamp, so we drain events for the `full_result`
                 // after because draining will drop timestamps.
-                let (_full_history, raw_events, l1_messages) = self.state.event_sink.flatten();
+                let (raw_events, l1_messages) = self.state.event_sink.flatten();
                 full_result.events = merge_events(raw_events)
                     .into_iter()
                     .map(|e| {
@@ -800,6 +802,7 @@ impl<S: Storage> VmInstance<S> {
                 .decommittment_processor
                 .get_decommitted_bytes_after_timestamp(timestamp_initial),
             cycles_used: self.state.local_state.monotonic_cycle_counter - cycles_initial,
+            gas_remaining: self.gas_remaining(),
         }
     }
 

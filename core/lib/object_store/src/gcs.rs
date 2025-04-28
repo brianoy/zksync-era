@@ -1,9 +1,9 @@
 //! GCS-based [`ObjectStore`] implementation.
 
-use std::{fmt, future::Future, time::Duration};
+use std::{error::Error as StdError, fmt, io};
 
 use async_trait::async_trait;
-use google_cloud_auth::{credentials::CredentialsFile, error::Error};
+use google_cloud_auth::{credentials::CredentialsFile, error::Error as AuthError};
 use google_cloud_storage::{
     client::{Client, ClientConfig},
     http::{
@@ -17,119 +17,138 @@ use google_cloud_storage::{
     },
 };
 use http::StatusCode;
+use tokio::sync::{AcquireError, Semaphore};
 
-use crate::{
-    metrics::GCS_METRICS,
-    raw::{Bucket, ObjectStore, ObjectStoreError},
-};
+use crate::raw::{Bucket, ObjectStore, ObjectStoreError};
 
-async fn retry<T, E, Fut, F>(max_retries: u16, mut f: F) -> Result<T, E>
-where
-    E: fmt::Display,
-    Fut: Future<Output = Result<T, E>>,
-    F: FnMut() -> Fut,
-{
-    let mut retries = 1;
-    let mut backoff = 1;
-    loop {
-        match f().await {
-            Ok(result) => return Ok(result),
-            Err(err) => {
-                tracing::warn!(%err, "Failed GCS request {retries}/{max_retries}, retrying.");
-                if retries > max_retries {
-                    return Err(err);
-                }
-                retries += 1;
-                tokio::time::sleep(Duration::from_secs(backoff)).await;
-                backoff *= 2;
-            }
-        }
-    }
-}
+/// Default maximum number of concurrent requests to GCS.
+/// Consider this a throttle to prevent overwhelming GCS or network card.
+/// The number has been picked after testing GCS in multiple conditions.
+/// Do NOT change it without proper, thorough testing.
+const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 500;
 
-pub struct GoogleCloudStorage {
+/// [`ObjectStore`] implementation based on GCS.
+pub struct GoogleCloudStore {
     bucket_prefix: String,
-    max_retries: u16,
     client: Client,
+    // used to limit the number of concurrent requests to GCS.
+    semaphore: Semaphore,
 }
 
-impl fmt::Debug for GoogleCloudStorage {
+impl fmt::Debug for GoogleCloudStore {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("GoogleCloudStorage")
+            .debug_struct("GoogleCloudStore")
             .field("bucket_prefix", &self.bucket_prefix)
-            .field("max_retries", &self.max_retries)
+            // Skip `client` as its representation may contain sensitive info
             .finish_non_exhaustive()
     }
 }
 
+/// Authentication mode for [`GoogleCloudStore`].
 #[derive(Debug, Clone)]
-pub enum GoogleCloudStorageAuthMode {
+#[non_exhaustive]
+pub enum GoogleCloudStoreAuthMode {
+    /// Authentication via a credentials file at the specified path.
     AuthenticatedWithCredentialFile(String),
+    /// Ambient authentication (works if the binary runs on Google Cloud).
     Authenticated,
+    /// Anonymous access (only works for public GCS buckets for read operations).
     Anonymous,
 }
 
-impl GoogleCloudStorage {
+impl GoogleCloudStore {
+    /// Creates a new cloud store.
+    ///
+    /// # Errors
+    ///
+    /// Propagates GCS initialization errors.
     pub async fn new(
-        auth_mode: GoogleCloudStorageAuthMode,
+        auth_mode: GoogleCloudStoreAuthMode,
         bucket_prefix: String,
-        max_retries: u16,
-    ) -> Self {
-        let client_config = retry(max_retries, || Self::get_client_config(auth_mode.clone()))
-            .await
-            .expect("failed fetching GCS client config after retries");
-
-        Self {
+    ) -> Result<Self, ObjectStoreError> {
+        let client_config = Self::get_client_config(auth_mode.clone()).await?;
+        let semaphore = Semaphore::new(DEFAULT_MAX_CONCURRENT_REQUESTS);
+        Ok(Self {
             client: Client::new(client_config),
             bucket_prefix,
-            max_retries,
-        }
+            semaphore,
+        })
+    }
+
+    /// Modifies the number of concurrent requests to GCS.
+    /// NOTE: Big numbers can saturate the network and/or cause the GCS to be unavailable.
+    #[must_use]
+    pub fn with_request_limit(mut self, request_limit: usize) -> Self {
+        self.semaphore = Semaphore::new(request_limit);
+        self
     }
 
     async fn get_client_config(
-        auth_mode: GoogleCloudStorageAuthMode,
-    ) -> Result<ClientConfig, Error> {
+        auth_mode: GoogleCloudStoreAuthMode,
+    ) -> Result<ClientConfig, AuthError> {
         match auth_mode {
-            GoogleCloudStorageAuthMode::AuthenticatedWithCredentialFile(path) => {
-                let cred_file = CredentialsFile::new_from_file(path)
-                    .await
-                    .expect("failed loading GCS credential file");
+            GoogleCloudStoreAuthMode::AuthenticatedWithCredentialFile(path) => {
+                let cred_file = CredentialsFile::new_from_file(path).await?;
                 ClientConfig::default().with_credentials(cred_file).await
             }
-            GoogleCloudStorageAuthMode::Authenticated => ClientConfig::default().with_auth().await,
-            GoogleCloudStorageAuthMode::Anonymous => Ok(ClientConfig::default().anonymous()),
+            GoogleCloudStoreAuthMode::Authenticated => ClientConfig::default().with_auth().await,
+            GoogleCloudStoreAuthMode::Anonymous => Ok(ClientConfig::default().anonymous()),
         }
     }
 
     fn filename(bucket: &str, filename: &str) -> String {
         format!("{bucket}/{filename}")
     }
+}
 
-    // For some bizarre reason, `async fn` doesn't work here, failing with the following error:
-    //
-    // > hidden type for `impl std::future::Future<Output = Result<(), ObjectStoreError>>`
-    // > captures lifetime that does not appear in bounds
-    fn remove_inner(
-        &self,
-        bucket: &'static str,
-        key: &str,
-    ) -> impl Future<Output = Result<(), ObjectStoreError>> + '_ {
-        let filename = Self::filename(bucket, key);
-        tracing::trace!(
-            "Removing data from GCS for key {filename} from bucket {}",
-            self.bucket_prefix
+impl From<AuthError> for ObjectStoreError {
+    fn from(err: AuthError) -> Self {
+        let is_retriable = matches!(
+            &err,
+            AuthError::HttpError(err) if is_retriable_http_error(err)
         );
+        Self::Initialization {
+            source: err.into(),
+            is_retriable,
+        }
+    }
+}
 
-        let request = DeleteObjectRequest {
-            bucket: self.bucket_prefix.clone(),
-            object: filename,
-            ..DeleteObjectRequest::default()
-        };
-        async move {
-            retry(self.max_retries, || self.client.delete_object(&request))
-                .await
-                .map_err(ObjectStoreError::from)
+fn is_retriable_http_error(err: &reqwest::Error) -> bool {
+    err.is_timeout()
+        || err.is_connect()
+        // Not all request errors are logically transient, but a significant part of them are (e.g.,
+        // `hyper` protocol-level errors), and it's safer to consider an error retriable.
+        || err.is_request()
+        || has_transient_io_source(err)
+        || err.status() == Some(StatusCode::BAD_GATEWAY)
+        || err.status() == Some(StatusCode::SERVICE_UNAVAILABLE)
+}
+
+fn get_source<'a, T: StdError + 'static>(mut err: &'a (dyn StdError + 'static)) -> Option<&'a T> {
+    loop {
+        if let Some(err) = err.downcast_ref::<T>() {
+            return Some(err);
+        }
+        err = err.source()?;
+    }
+}
+
+fn has_transient_io_source(err: &(dyn StdError + 'static)) -> bool {
+    // We treat any I/O errors as retriable. This isn't always true, but frequently occurring I/O errors
+    // (e.g., "connection reset by peer") *are* transient, and treating an error as retriable is a safer option,
+    // even if it can lead to unnecessary retries.
+    get_source::<io::Error>(err).is_some()
+}
+
+/// This is necessary due to the fact that Acquiring a semaphore can fail if the semaphore is closed.
+/// Whilst current code does not expect such scenario, nor "should it be possible", it is better to have a graceful catch case instead of unwrapping.
+impl From<AcquireError> for ObjectStoreError {
+    fn from(err: AcquireError) -> Self {
+        ObjectStoreError::Other {
+            source: err.into(),
+            is_retriable: false,
         }
     }
 }
@@ -141,21 +160,36 @@ impl From<HttpError> for ObjectStoreError {
                 .status()
                 .map_or(false, |status| matches!(status, StatusCode::NOT_FOUND)),
             HttpError::Response(response) => response.code == StatusCode::NOT_FOUND.as_u16(),
-            HttpError::TokenSource(_) => false,
+            _ => false,
         };
 
         if is_not_found {
             ObjectStoreError::KeyNotFound(err.into())
         } else {
-            ObjectStoreError::Other(err.into())
+            let is_retriable = match &err {
+                HttpError::HttpClient(err) => is_retriable_http_error(err),
+                HttpError::TokenSource(err) => {
+                    // Token sources are mostly based on the `reqwest` HTTP client, so retriable error detection
+                    // can reuse the same logic.
+                    let err = err.as_ref();
+                    has_transient_io_source(err)
+                        || get_source::<reqwest::Error>(err).is_some_and(is_retriable_http_error)
+                }
+                HttpError::Response(err) => err.is_retriable(),
+                _ => false,
+            };
+            ObjectStoreError::Other {
+                is_retriable,
+                source: err.into(),
+            }
         }
     }
 }
 
 #[async_trait]
-impl ObjectStore for GoogleCloudStorage {
+impl ObjectStore for GoogleCloudStore {
     async fn get_raw(&self, bucket: Bucket, key: &str) -> Result<Vec<u8>, ObjectStoreError> {
-        let fetch_latency = GCS_METRICS.start_fetch(bucket);
+        let _permit = self.semaphore.acquire().await?;
         let filename = Self::filename(bucket.as_str(), key);
         tracing::trace!(
             "Fetching data from GCS for key {filename} from bucket {}",
@@ -167,17 +201,10 @@ impl ObjectStore for GoogleCloudStorage {
             object: filename,
             ..GetObjectRequest::default()
         };
-        let range = Range::default();
-        let blob = retry(self.max_retries, || {
-            self.client.download_object(&request, &range)
-        })
-        .await;
-
-        let elapsed = fetch_latency.observe();
-        tracing::trace!(
-            "Fetched data from GCS for key {key} from bucket {bucket} and it took: {elapsed:?}"
-        );
-        blob.map_err(ObjectStoreError::from)
+        self.client
+            .download_object(&request, &Range::default())
+            .await
+            .map_err(Into::into)
     }
 
     async fn put_raw(
@@ -186,7 +213,7 @@ impl ObjectStore for GoogleCloudStorage {
         key: &str,
         value: Vec<u8>,
     ) -> Result<(), ObjectStoreError> {
-        let store_latency = GCS_METRICS.start_store(bucket);
+        let _permit = self.semaphore.acquire().await?;
         let filename = Self::filename(bucket.as_str(), key);
         tracing::trace!(
             "Storing data to GCS for key {filename} from bucket {}",
@@ -198,21 +225,27 @@ impl ObjectStore for GoogleCloudStorage {
             bucket: self.bucket_prefix.clone(),
             ..Default::default()
         };
-        let object = retry(self.max_retries, || {
-            self.client
-                .upload_object(&request, value.clone(), &upload_type)
-        })
-        .await;
-
-        let elapsed = store_latency.observe();
-        tracing::trace!(
-            "Stored data to GCS for key {key} from bucket {bucket} and it took: {elapsed:?}"
-        );
-        object.map(drop).map_err(ObjectStoreError::from)
+        self.client
+            .upload_object(&request, value.clone(), &upload_type)
+            .await?;
+        Ok(())
     }
 
     async fn remove_raw(&self, bucket: Bucket, key: &str) -> Result<(), ObjectStoreError> {
-        self.remove_inner(bucket.as_str(), key).await
+        let _permit = self.semaphore.acquire().await?;
+        let filename = Self::filename(bucket.as_str(), key);
+        tracing::trace!(
+            "Removing data from GCS for key {filename} from bucket {}",
+            self.bucket_prefix
+        );
+
+        let request = DeleteObjectRequest {
+            bucket: self.bucket_prefix.clone(),
+            object: filename,
+            ..DeleteObjectRequest::default()
+        };
+        self.client.delete_object(&request).await?;
+        Ok(())
     }
 
     fn storage_prefix_raw(&self, bucket: Bucket) -> String {
@@ -221,45 +254,5 @@ impl ObjectStore for GoogleCloudStorage {
             self.bucket_prefix.clone(),
             bucket.as_str()
         )
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use std::sync::atomic::{AtomicU16, Ordering};
-
-    use super::*;
-
-    #[tokio::test]
-    async fn test_retry_success_immediate() {
-        let result = retry(2, || async { Ok::<_, &'static str>(42) }).await;
-        assert_eq!(result, Ok(42));
-    }
-
-    #[tokio::test]
-    async fn test_retry_failure_exhausted() {
-        let result = retry(2, || async { Err::<i32, _>("oops") }).await;
-        assert_eq!(result, Err("oops"));
-    }
-
-    async fn retry_success_after_n_retries(n: u16) -> Result<u32, String> {
-        let retries = AtomicU16::new(0);
-        let result = retry(n, || async {
-            let retries = retries.fetch_add(1, Ordering::Relaxed);
-            if retries + 1 == n {
-                Ok(42)
-            } else {
-                Err("oops")
-            }
-        })
-        .await;
-
-        result.map_err(|_| "Retry failed".to_string())
-    }
-
-    #[tokio::test]
-    async fn test_retry_success_after_retry() {
-        let result = retry(2, || retry_success_after_n_retries(2)).await;
-        assert_eq!(result, Ok(42));
     }
 }

@@ -16,22 +16,23 @@ use zk_evm_1_3_1::{
     },
 };
 use zksync_types::{
-    get_code_key, web3::signing::keccak256, AccountTreeId, Address, StorageKey,
-    ACCOUNT_CODE_STORAGE_ADDRESS, BOOTLOADER_ADDRESS, CONTRACT_DEPLOYER_ADDRESS, H256,
-    KECCAK256_PRECOMPILE_ADDRESS, KNOWN_CODES_STORAGE_ADDRESS, L1_MESSENGER_ADDRESS,
-    L2_ETH_TOKEN_ADDRESS, MSG_VALUE_SIMULATOR_ADDRESS, SYSTEM_CONTEXT_ADDRESS, U256,
-};
-use zksync_utils::{
-    be_bytes_to_safe_address, h256_to_account_address, u256_to_account_address, u256_to_h256,
+    get_code_key, h256_to_address, u256_to_address, u256_to_h256, web3::keccak256, AccountTreeId,
+    Address, StorageKey, ACCOUNT_CODE_STORAGE_ADDRESS, BOOTLOADER_ADDRESS,
+    CONTRACT_DEPLOYER_ADDRESS, H256, KECCAK256_PRECOMPILE_ADDRESS, KNOWN_CODES_STORAGE_ADDRESS,
+    L1_MESSENGER_ADDRESS, L2_BASE_TOKEN_ADDRESS, MSG_VALUE_SIMULATOR_ADDRESS,
+    SYSTEM_CONTEXT_ADDRESS, U256,
 };
 
-use crate::vm_m5::{
-    errors::VmRevertReasonParsingResult,
-    memory::SimpleMemory,
-    storage::{Storage, StoragePtr},
-    utils::{aux_heap_page_from_base, heap_page_from_base},
-    vm_instance::{get_vm_hook_params, VM_HOOK_POSITION},
-    vm_with_bootloader::BOOTLOADER_HEAP_PAGE,
+use crate::{
+    utils::bytecode::be_bytes_to_safe_address,
+    vm_m5::{
+        errors::VmRevertReasonParsingResult,
+        memory::SimpleMemory,
+        storage::{Storage, StoragePtr},
+        utils::{aux_heap_page_from_base, heap_page_from_base},
+        vm_instance::{get_vm_hook_params, VM_HOOK_POSITION},
+        vm_with_bootloader::BOOTLOADER_HEAP_PAGE,
+    },
 };
 
 pub trait ExecutionEndTracer: Tracer<SupportedMemory = SimpleMemory> {
@@ -200,7 +201,7 @@ fn valid_eth_token_call(address: Address, msg_sender: Address) -> bool {
     let is_valid_caller = msg_sender == MSG_VALUE_SIMULATOR_ADDRESS
         || msg_sender == CONTRACT_DEPLOYER_ADDRESS
         || msg_sender == BOOTLOADER_ADDRESS;
-    address == L2_ETH_TOKEN_ADDRESS && is_valid_caller
+    address == L2_BASE_TOKEN_ADDRESS && is_valid_caller
 }
 
 /// Tracer that is used to ensure that the validation adheres to all the rules
@@ -322,7 +323,7 @@ impl<S: Storage> ValidationTracer<S> {
 
         // The user is allowed to touch its own slots or slots semantically related to him.
         let valid_users_slot = address == self.user_address
-            || u256_to_account_address(&key) == self.user_address
+            || u256_to_address(&key) == self.user_address
             || self.auxilary_allowed_slots.contains(&u256_to_h256(key));
         if valid_users_slot {
             return true;
@@ -383,7 +384,7 @@ impl<S: Storage> ValidationTracer<S> {
                 let packed_abi = data.src0_value.value;
                 let call_destination_value = data.src1_value.value;
 
-                let called_address = u256_to_account_address(&call_destination_value);
+                let called_address = u256_to_address(&call_destination_value);
                 let far_call_abi = FarCallABI::from_u256(packed_abi);
 
                 if called_address == KECCAK256_PRECOMPILE_ADDRESS
@@ -450,7 +451,7 @@ impl<S: Storage> ValidationTracer<S> {
                     let value = self.storage.borrow_mut().get_value(&storage_key);
 
                     return Ok(NewTrustedValidationItems {
-                        new_trusted_addresses: vec![h256_to_account_address(&value)],
+                        new_trusted_addresses: vec![h256_to_address(&value)],
                         ..Default::default()
                     });
                 }
@@ -799,7 +800,7 @@ fn get_debug_log(state: &VmLocalStateData<'_>, memory: &SimpleMemory) -> String 
     let data = U256::from_big_endian(&data);
 
     // For long data, it is better to use hex-encoding for greater readability
-    let data_str = if data > U256::from(u64::max_value()) {
+    let data_str = if data > U256::from(u64::MAX) {
         let mut bytes = [0u8; 32];
         data.to_big_endian(&mut bytes);
         format!("0x{}", hex::encode(bytes))

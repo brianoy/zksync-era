@@ -1,0 +1,15 @@
+# ZK Stack protocol specs
+
+- [Introduction](./introduction.md)
+  - [Overview](./overview.md)
+  - [Blocks and Batches](./blocks_batches.md)
+  - [L1 Smart Contracts](./l1_smart_contracts.md)
+- [Prover](./prover/overview.md)
+  - [Getting Started](./prover/getting_started.md)
+  - [ZK Terminology](./prover/zk_terminology.md)
+  - [Function Check if Satisfied](./prover/boojum_function_check_if_satisfied.md)
+  - [Gadgets](./prover/boojum_gadgets.md)
+  - [Circuit Testing](./prover/circuit_testing.md)
+  - [Circuits Overview](./prover/circuits/overview.md)
+- [Era VM](./era_vm_specification/README.md)
+  - [VM primer](./era_vm_specification/zkSync_era_virtual_machine_primer.md)

@@ -2,42 +2,33 @@
 
 use std::ops;
 
-use zksync_dal::StorageProcessor;
+use zksync_dal::{pruning_dal::HardPruningStats, Connection, ConnectionPool, Core, CoreDal};
 use zksync_types::{
-    block::{L1BatchHeader, MiniblockHeader},
+    block::{L1BatchHeader, L2BlockHeader},
     snapshots::SnapshotRecoveryStatus,
-    AccountTreeId, Address, L1BatchNumber, MiniblockNumber, ProtocolVersion, ProtocolVersionId,
+    AccountTreeId, Address, L1BatchNumber, L2BlockNumber, ProtocolVersion, ProtocolVersionId,
     StorageKey, StorageLog, H256,
 };
 
-pub(crate) async fn prepare_postgres(conn: &mut StorageProcessor<'_>) {
-    if conn.blocks_dal().is_genesis_needed().await.unwrap() {
-        conn.protocol_versions_dal()
-            .save_protocol_version_with_tx(ProtocolVersion::default())
-            .await;
-        // The created genesis block is likely to be invalid, but since it's not committed,
-        // we don't really care.
-        let genesis_storage_logs = gen_storage_logs(0..20);
-        create_miniblock(conn, MiniblockNumber(0), genesis_storage_logs.clone()).await;
-        create_l1_batch(conn, L1BatchNumber(0), &genesis_storage_logs).await;
-    }
+pub(crate) async fn prepare_postgres(conn: &mut Connection<'_, Core>) {
+    prepare_postgres_with_log_count(conn, 20).await;
+}
 
-    conn.storage_logs_dal()
-        .rollback_storage_logs(MiniblockNumber(0))
+pub(crate) async fn prepare_postgres_with_log_count(
+    conn: &mut Connection<'_, Core>,
+    log_count: u64,
+) -> Vec<StorageLog> {
+    assert!(conn.blocks_dal().is_genesis_needed().await.unwrap());
+    conn.protocol_versions_dal()
+        .save_protocol_version_with_tx(&ProtocolVersion::default())
         .await
         .unwrap();
-    conn.blocks_dal()
-        .delete_miniblocks(MiniblockNumber(0))
-        .await
-        .unwrap();
-    conn.blocks_dal()
-        .delete_l1_batches(L1BatchNumber(0))
-        .await
-        .unwrap();
-    conn.blocks_dal()
-        .delete_initial_writes(L1BatchNumber(0))
-        .await
-        .unwrap();
+    // The created genesis block is likely to be invalid, but since it's not committed,
+    // we don't really care.
+    let genesis_storage_logs = gen_storage_logs(0..log_count);
+    create_l2_block(conn, L2BlockNumber(0), &genesis_storage_logs).await;
+    create_l1_batch(conn, L1BatchNumber(0), &genesis_storage_logs).await;
+    genesis_storage_logs
 }
 
 pub(crate) fn gen_storage_logs(indices: ops::Range<u64>) -> Vec<StorageLog> {
@@ -67,15 +58,15 @@ pub(crate) fn gen_storage_logs(indices: ops::Range<u64>) -> Vec<StorageLog> {
 
 #[allow(clippy::default_trait_access)]
 // ^ `BaseSystemContractsHashes::default()` would require a new direct dependency
-pub(crate) async fn create_miniblock(
-    conn: &mut StorageProcessor<'_>,
-    miniblock_number: MiniblockNumber,
-    block_logs: Vec<StorageLog>,
+pub(crate) async fn create_l2_block(
+    conn: &mut Connection<'_, Core>,
+    l2_block_number: L2BlockNumber,
+    block_logs: &[StorageLog],
 ) {
-    let miniblock_header = MiniblockHeader {
-        number: miniblock_number,
+    let l2_block_header = L2BlockHeader {
+        number: l2_block_number,
         timestamp: 0,
-        hash: H256::from_low_u64_be(u64::from(miniblock_number.0)),
+        hash: H256::from_low_u64_be(u64::from(l2_block_number.0)),
         l1_tx_count: 0,
         l2_tx_count: 0,
         fee_account_address: Address::default(),
@@ -85,14 +76,17 @@ pub(crate) async fn create_miniblock(
         base_system_contracts_hashes: Default::default(),
         protocol_version: Some(Default::default()),
         virtual_blocks: 0,
+        gas_limit: 0,
+        logs_bloom: Default::default(),
+        pubdata_params: Default::default(),
     };
 
     conn.blocks_dal()
-        .insert_miniblock(&miniblock_header)
+        .insert_l2_block(&l2_block_header)
         .await
         .unwrap();
     conn.storage_logs_dal()
-        .insert_storage_logs(miniblock_number, &[(H256::zero(), block_logs)])
+        .insert_storage_logs(l2_block_number, block_logs)
         .await
         .unwrap();
 }
@@ -100,7 +94,7 @@ pub(crate) async fn create_miniblock(
 #[allow(clippy::default_trait_access)]
 // ^ `BaseSystemContractsHashes::default()` would require a new direct dependency
 pub(crate) async fn create_l1_batch(
-    conn: &mut StorageProcessor<'_>,
+    conn: &mut Connection<'_, Core>,
     l1_batch_number: L1BatchNumber,
     logs_for_initial_writes: &[StorageLog],
 ) {
@@ -110,35 +104,41 @@ pub(crate) async fn create_l1_batch(
         .await
         .unwrap();
     conn.blocks_dal()
-        .mark_miniblocks_as_executed_in_l1_batch(l1_batch_number)
+        .mark_l2_blocks_as_executed_in_l1_batch(l1_batch_number)
         .await
         .unwrap();
 
     let mut written_keys: Vec<_> = logs_for_initial_writes.iter().map(|log| log.key).collect();
     written_keys.sort_unstable();
+    let written_keys: Vec<_> = written_keys.iter().map(StorageKey::hashed_key).collect();
     conn.storage_logs_dedup_dal()
         .insert_initial_writes(l1_batch_number, &written_keys)
         .await
         .unwrap();
 }
 
-pub(crate) async fn prepare_postgres_for_snapshot_recovery(
-    conn: &mut StorageProcessor<'_>,
-) -> (SnapshotRecoveryStatus, Vec<StorageLog>) {
-    conn.protocol_versions_dal()
-        .save_protocol_version_with_tx(ProtocolVersion::default())
-        .await;
-
-    let snapshot_recovery = SnapshotRecoveryStatus {
+pub(crate) fn mock_snapshot_recovery_status() -> SnapshotRecoveryStatus {
+    SnapshotRecoveryStatus {
         l1_batch_number: L1BatchNumber(23),
         l1_batch_timestamp: 23,
         l1_batch_root_hash: H256::zero(), // not used
-        miniblock_number: MiniblockNumber(42),
-        miniblock_timestamp: 42,
-        miniblock_hash: H256::zero(), // not used
+        l2_block_number: L2BlockNumber(42),
+        l2_block_timestamp: 42,
+        l2_block_hash: H256::zero(), // not used
         protocol_version: ProtocolVersionId::latest(),
         storage_logs_chunks_processed: vec![true; 100],
-    };
+    }
+}
+
+pub(crate) async fn prepare_postgres_for_snapshot_recovery(
+    conn: &mut Connection<'_, Core>,
+) -> (SnapshotRecoveryStatus, Vec<StorageLog>) {
+    conn.protocol_versions_dal()
+        .save_protocol_version_with_tx(&ProtocolVersion::default())
+        .await
+        .unwrap();
+
+    let snapshot_recovery = mock_snapshot_recovery_status();
     conn.snapshot_recovery_dal()
         .insert_initial_recovery_status(&snapshot_recovery)
         .await
@@ -146,17 +146,51 @@ pub(crate) async fn prepare_postgres_for_snapshot_recovery(
 
     let snapshot_storage_logs = gen_storage_logs(100..200);
     conn.storage_logs_dal()
-        .insert_storage_logs(
-            snapshot_recovery.miniblock_number,
-            &[(H256::zero(), snapshot_storage_logs.clone())],
-        )
+        .insert_storage_logs(snapshot_recovery.l2_block_number, &snapshot_storage_logs)
         .await
         .unwrap();
     let mut written_keys: Vec<_> = snapshot_storage_logs.iter().map(|log| log.key).collect();
     written_keys.sort_unstable();
+    let written_keys: Vec<_> = written_keys.iter().map(StorageKey::hashed_key).collect();
     conn.storage_logs_dedup_dal()
         .insert_initial_writes(snapshot_recovery.l1_batch_number, &written_keys)
         .await
         .unwrap();
     (snapshot_recovery, snapshot_storage_logs)
+}
+
+pub(crate) async fn prune_storage(
+    pool: &ConnectionPool<Core>,
+    pruned_l1_batch: L1BatchNumber,
+) -> HardPruningStats {
+    // Emulate pruning batches in the storage.
+    let mut storage = pool.connection().await.unwrap();
+    let (_, pruned_l2_block) = storage
+        .blocks_dal()
+        .get_l2_block_range_of_l1_batch(pruned_l1_batch)
+        .await
+        .unwrap()
+        .expect("L1 batch not present in Postgres");
+    let root_hash = H256::zero(); // Doesn't matter for storage recovery
+
+    storage
+        .pruning_dal()
+        .insert_soft_pruning_log(pruned_l1_batch, pruned_l2_block)
+        .await
+        .unwrap();
+    let pruning_stats = storage
+        .pruning_dal()
+        .hard_prune_batches_range(pruned_l1_batch, pruned_l2_block)
+        .await
+        .unwrap();
+    assert!(
+        pruning_stats.deleted_l1_batches > 0 && pruning_stats.deleted_l2_blocks > 0,
+        "{pruning_stats:?}"
+    );
+    storage
+        .pruning_dal()
+        .insert_hard_pruning_log(pruned_l1_batch, pruned_l2_block, root_hash)
+        .await
+        .unwrap();
+    pruning_stats
 }

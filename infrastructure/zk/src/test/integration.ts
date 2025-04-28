@@ -1,6 +1,7 @@
 import { Command } from 'commander';
-import * as utils from '../utils';
+import * as utils from 'utils';
 import * as config from '../config';
+import deepExtend from 'deep-extend';
 
 export async function all() {
     await server();
@@ -25,7 +26,9 @@ export async function server(options: string[] = []) {
         process.env.ZKSYNC_WEB3_WS_API_URL = `ws://127.0.0.1:${process.env.EN_WS_PORT}`;
         process.env.ETH_CLIENT_WEB3_URL = process.env.EN_ETH_CLIENT_URL;
 
-        const configs = config.collectVariables(config.loadConfig('dev'));
+        // We need base configs for integration tests
+        const baseConfigs = config.loadConfig('dev');
+        const configs = config.collectVariables(deepExtend(baseConfigs, config.loadConfig(process.env.ZKSYNC_ENV)));
 
         process.env.CONTRACTS_PRIORITY_TX_MAX_GAS_LIMIT = configs.get('CONTRACTS_PRIORITY_TX_MAX_GAS_LIMIT');
         process.env.CHAIN_STATE_KEEPER_VALIDATION_COMPUTATIONAL_GAS_LIMIT = configs.get(
@@ -43,6 +46,11 @@ export async function fees() {
 export async function revert(bail: boolean = false) {
     const flag = bail ? ' --bail' : '';
     await utils.spawn('yarn revert-test revert-and-restart-test' + flag);
+}
+
+export async function revert_en(bail: boolean = false) {
+    const flag = bail ? ' --bail' : '';
+    await utils.spawn('yarn revert-test revert-and-restart-test-en' + flag);
 }
 
 export async function upgrade(bail: boolean = false) {
@@ -80,6 +88,13 @@ command
     .option('--bail')
     .action(async (cmd: Command) => {
         await revert(cmd.bail);
+    });
+command
+    .command('revert-en')
+    .description('run EN revert test')
+    .option('--bail')
+    .action(async (cmd: Command) => {
+        await revert_en(cmd.bail);
     });
 command
     .command('upgrade')

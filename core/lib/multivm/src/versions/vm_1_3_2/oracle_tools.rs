@@ -1,19 +1,22 @@
 use std::fmt::Debug;
 
 use zk_evm_1_3_3::witness_trace::DummyTracer;
-use zksync_state::{StoragePtr, WriteStorage};
 
-use crate::vm_1_3_2::{
-    event_sink::InMemoryEventSink,
-    history_recorder::HistoryMode,
-    memory::SimpleMemory,
-    oracles::{
-        decommitter::DecommitterOracle, precompile::PrecompilesProcessorWithHistory,
-        storage::StorageOracle,
+use crate::{
+    interface::storage::{StoragePtr, WriteStorage},
+    vm_1_3_2::{
+        event_sink::InMemoryEventSink,
+        history_recorder::HistoryMode,
+        memory::SimpleMemory,
+        oracles::{
+            decommitter::DecommitterOracle, precompile::PrecompilesProcessorWithHistory,
+            storage::StorageOracle,
+        },
     },
 };
 
 /// zkEVM requires a bunch of objects implementing given traits to work.
+///
 /// For example: Storage, Memory, PrecompilerProcessor etc
 /// (you can find all these traits in zk_evm crate -> src/abstractions/mod.rs)
 /// For each of these traits, we have a local implementation (for example StorageOracle)

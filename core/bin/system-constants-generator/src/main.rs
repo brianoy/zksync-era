@@ -1,21 +1,25 @@
 use std::fs;
 
 use codegen::{Block, Scope};
-use multivm::{
-    utils::{get_bootloader_encoding_space, get_bootloader_max_txs_in_batch},
-    vm_latest::constants::MAX_VM_PUBDATA_PER_BATCH,
-};
 use serde::{Deserialize, Serialize};
-use zkevm_test_harness_1_3_3::zk_evm::zkevm_opcode_defs::{
-    circuit_prices::{
-        ECRECOVER_CIRCUIT_COST_IN_ERGS, KECCAK256_CIRCUIT_COST_IN_ERGS, SHA256_CIRCUIT_COST_IN_ERGS,
+use zksync_multivm::{
+    utils::{
+        get_bootloader_encoding_space, get_bootloader_max_txs_in_batch, get_max_new_factory_deps,
     },
-    system_params::MAX_TX_ERGS_LIMIT,
+    vm_latest::constants::MAX_VM_PUBDATA_PER_BATCH,
+    zk_evm_latest::zkevm_opcode_defs::{
+        circuit_prices::{
+            ECRECOVER_CIRCUIT_COST_IN_ERGS, KECCAK256_CIRCUIT_COST_IN_ERGS,
+            SHA256_CIRCUIT_COST_IN_ERGS,
+        },
+        system_params::MAX_TX_ERGS_LIMIT,
+    },
 };
 use zksync_types::{
     IntrinsicSystemGasConstants, ProtocolVersionId, GUARANTEED_PUBDATA_IN_TX,
-    L1_GAS_PER_PUBDATA_BYTE, MAX_NEW_FACTORY_DEPS, REQUIRED_L1_TO_L2_GAS_PER_PUBDATA_BYTE,
+    L1_GAS_PER_PUBDATA_BYTE, REQUIRED_L1_TO_L2_GAS_PER_PUBDATA_BYTE,
 };
+use zksync_utils::env::Workspace;
 
 // For configs we will use the default value of `800_000` to represent the rough amount of L1 gas
 // needed to cover the batch expenses.
@@ -71,7 +75,7 @@ pub fn generate_l1_contracts_system_config(gas_constants: &IntrinsicSystemGasCon
         l1_tx_delta_544_encoding_bytes: gas_constants.l1_tx_delta_544_encoding_bytes,
         l1_tx_delta_factory_deps_l2_gas: gas_constants.l1_tx_delta_factory_dep_gas,
         l1_tx_delta_factory_deps_pubdata: gas_constants.l1_tx_delta_factory_dep_pubdata,
-        max_new_factory_deps: MAX_NEW_FACTORY_DEPS as u32,
+        max_new_factory_deps: get_max_new_factory_deps(ProtocolVersionId::latest().into()) as u32,
         required_l2_gas_price_per_pubdata: REQUIRED_L1_TO_L2_GAS_PER_PUBDATA_BYTE,
     };
 
@@ -208,8 +212,8 @@ fn generate_rust_fee_constants(intrinsic_gas_constants: &IntrinsicSystemGasConst
 }
 
 fn save_file(path_in_repo: &str, content: String) {
-    let zksync_home = std::env::var("ZKSYNC_HOME").expect("No ZKSYNC_HOME env var");
-    let fee_constants_path = format!("{zksync_home}/{path_in_repo}");
+    let zksync_home = Workspace::locate().root();
+    let fee_constants_path = zksync_home.join(path_in_repo);
 
     fs::write(fee_constants_path, content)
         .unwrap_or_else(|_| panic!("Failed to write to {}", path_in_repo));

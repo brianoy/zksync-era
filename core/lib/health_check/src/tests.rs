@@ -81,9 +81,14 @@ async fn updating_health_status_return_value() {
 async fn aggregating_health_checks() {
     let (first_check, first_updater) = ReactiveHealthCheck::new("first");
     let (second_check, second_updater) = ReactiveHealthCheck::new("second");
+    let inner = AppHealthCheckInner {
+        app_details: None,
+        components: vec![Arc::new(first_check), Arc::new(second_check)],
+        slow_time_limit: AppHealthCheck::DEFAULT_SLOW_TIME_LIMIT,
+        hard_time_limit: AppHealthCheck::DEFAULT_HARD_TIME_LIMIT,
+    };
     let checks = AppHealthCheck {
-        components: Mutex::new(vec![Arc::new(first_check), Arc::new(second_check)]),
-        ..AppHealthCheck::default()
+        inner: Mutex::new(inner),
     };
 
     let app_health = checks.check_health().await;
@@ -133,4 +138,18 @@ async fn aggregating_health_checks() {
         app_health.components["second"].status,
         HealthStatus::Affected
     );
+}
+
+#[test]
+fn adding_duplicate_component() {
+    let checks = AppHealthCheck::default();
+    let (health_check, _health_updater) = ReactiveHealthCheck::new("test");
+    checks.insert_component(health_check.clone()).unwrap();
+
+    let err = checks.insert_component(health_check.clone()).unwrap_err();
+    assert_matches!(err, AppHealthCheckError::RedefinedComponent("test"));
+    let err = checks
+        .insert_custom_component(Arc::new(health_check))
+        .unwrap_err();
+    assert_matches!(err, AppHealthCheckError::RedefinedComponent("test"));
 }

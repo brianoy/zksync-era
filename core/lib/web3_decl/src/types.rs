@@ -3,29 +3,27 @@
 //! Most of the types are re-exported from the `web3` crate, but some of them maybe extended with
 //! new variants (enums) or optional fields (structures).
 //!
-//! These "extensions" are required to provide more zkSync-specific information while remaining Web3-compilant.
+//! These "extensions" are required to provide more ZKsync-specific information while remaining Web3-compilant.
 
-use core::{
-    convert::{TryFrom, TryInto},
-    fmt,
-    marker::PhantomData,
-};
+use core::convert::{TryFrom, TryInto};
 
 use rlp::Rlp;
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 pub use zksync_types::{
     api::{Block, BlockNumber, Log, TransactionReceipt, TransactionRequest},
-    vm_trace::{ContractSourceDebugInfo, VmDebugTrace, VmExecutionStep},
+    ethabi,
     web3::{
-        ethabi,
-        types::{
-            Address, BlockHeader, Bytes, CallRequest, FeeHistory, Index, SyncState, TraceFilter,
-            Transaction, Work, H160, H256, H64, U256, U64,
-        },
+        BlockHeader, Bytes, CallRequest, FeeHistory, Index, SyncState, TraceFilter, U64Number,
+        ValueOrArray, Work,
     },
+    Address, Transaction, H160, H256, H64, U256, U64,
+};
+use zksync_types::{
+    commitment::L1BatchCommitmentMode, protocol_version::ProtocolSemanticVersion, L1ChainId,
+    L2ChainId,
 };
 
-/// Token in the zkSync network
+/// Token in the ZKsync network
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Token {
@@ -104,71 +102,6 @@ pub enum FilterChanges {
     Empty([u8; 0]),
 }
 
-/// Either value or array of values.
-///
-/// A value must serialize into a string.
-#[derive(Default, Debug, PartialEq, Clone)]
-pub struct ValueOrArray<T>(pub Vec<T>);
-
-impl<T> From<T> for ValueOrArray<T> {
-    fn from(value: T) -> Self {
-        Self(vec![value])
-    }
-}
-
-impl<T: Serialize> Serialize for ValueOrArray<T> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self.0.len() {
-            0 => serializer.serialize_none(),
-            1 => Serialize::serialize(&self.0[0], serializer),
-            _ => Serialize::serialize(&self.0, serializer),
-        }
-    }
-}
-
-impl<'de, T: Deserialize<'de>> Deserialize<'de> for ValueOrArray<T> {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct Visitor<T>(PhantomData<T>);
-
-        impl<'de, T: Deserialize<'de>> de::Visitor<'de> for Visitor<T> {
-            type Value = ValueOrArray<T>;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("string value or sequence of values")
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                use serde::de::IntoDeserializer;
-
-                Deserialize::deserialize(value.into_deserializer())
-                    .map(|value| ValueOrArray(vec![value]))
-            }
-
-            fn visit_seq<S>(self, mut visitor: S) -> Result<Self::Value, S::Error>
-            where
-                S: de::SeqAccess<'de>,
-            {
-                let mut elements = Vec::with_capacity(visitor.size_hint().unwrap_or(1));
-                while let Some(element) = visitor.next_element()? {
-                    elements.push(element);
-                }
-                Ok(ValueOrArray(elements))
-            }
-        }
-
-        deserializer.deserialize_any(Visitor(PhantomData))
-    }
-}
-
 /// Filter
 #[derive(Default, Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct Filter {
@@ -186,6 +119,28 @@ pub struct Filter {
     pub topics: Option<Vec<Option<ValueOrArray<H256>>>>,
     #[serde(rename = "blockHash", skip_serializing_if = "Option::is_none")]
     pub block_hash: Option<H256>,
+}
+
+impl From<zksync_types::web3::Filter> for Filter {
+    fn from(value: zksync_types::web3::Filter) -> Self {
+        let convert_block_number = |b: zksync_types::web3::BlockNumber| match b {
+            zksync_types::web3::BlockNumber::Finalized => BlockNumber::Finalized,
+            zksync_types::web3::BlockNumber::Safe => BlockNumber::Finalized,
+            zksync_types::web3::BlockNumber::Latest => BlockNumber::Latest,
+            zksync_types::web3::BlockNumber::Earliest => BlockNumber::Earliest,
+            zksync_types::web3::BlockNumber::Pending => BlockNumber::Pending,
+            zksync_types::web3::BlockNumber::Number(n) => BlockNumber::Number(n),
+        };
+        let from_block = value.from_block.map(convert_block_number);
+        let to_block = value.to_block.map(convert_block_number);
+        Filter {
+            from_block,
+            to_block,
+            address: value.address,
+            topics: value.topics,
+            block_hash: value.block_hash,
+        }
+    }
 }
 
 /// Filter Builder
@@ -348,9 +303,46 @@ pub enum PubSubResult {
     Syncing(bool),
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EcosystemContractsDto {
+    pub bridgehub_proxy_addr: Address,
+    pub state_transition_proxy_addr: Option<Address>,
+    pub transparent_proxy_admin_addr: Address,
+    pub l1_bytecodes_supplier_addr: Option<Address>,
+    pub l1_wrapped_base_token_store: Option<Address>,
+    pub server_notifier_addr: Option<Address>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq))]
+pub struct GenesisConfigDto {
+    pub protocol_version: ProtocolSemanticVersion,
+    pub genesis_root_hash: H256,
+    pub rollup_last_leaf_index: u64,
+    pub genesis_commitment: H256,
+    pub bootloader_hash: H256,
+    pub default_aa_hash: H256,
+    pub evm_emulator_hash: Option<H256>,
+    pub l1_chain_id: L1ChainId,
+    pub l2_chain_id: L2ChainId,
+    // Rename is required to not introduce breaking changes in the API for existing clients.
+    #[serde(
+        alias = "recursion_scheduler_level_vk_hash",
+        rename(serialize = "recursion_scheduler_level_vk_hash")
+    )]
+    pub snark_wrapper_vk_hash: H256,
+    pub fflonk_snark_wrapper_vk_hash: Option<H256>,
+    pub fee_account: Address,
+    pub dummy_verifier: bool,
+    pub l1_batch_commit_data_generator_mode: L1BatchCommitmentMode,
+}
+
 #[cfg(test)]
 mod tests {
-    use zksync_types::api::{BlockId, BlockIdVariant};
+    use zksync_types::{
+        api::{BlockId, BlockIdVariant},
+        ProtocolVersionId,
+    };
 
     use super::*;
 
@@ -441,5 +433,58 @@ mod tests {
 
         let restored_value: ValueOrArray<Address> = serde_json::from_value(json).unwrap();
         assert_eq!(restored_value, value);
+    }
+
+    // This test checks that serde overrides (`rename`, `alias`) work for `snark_wrapper_vk_hash` field.
+    #[test]
+    fn genesis_serde_snark_wrapper_vk_hash() {
+        let genesis = GenesisConfigDto {
+            genesis_root_hash: H256::repeat_byte(0x01),
+            rollup_last_leaf_index: 26,
+            snark_wrapper_vk_hash: H256::repeat_byte(0x02),
+            fflonk_snark_wrapper_vk_hash: None,
+            fee_account: Address::zero(),
+            genesis_commitment: H256::repeat_byte(0x17),
+            bootloader_hash: H256::zero(),
+            default_aa_hash: H256::zero(),
+            evm_emulator_hash: None,
+            l1_chain_id: L1ChainId(9),
+            protocol_version: ProtocolSemanticVersion {
+                minor: ProtocolVersionId::latest(),
+                patch: 0.into(),
+            },
+            l2_chain_id: L2ChainId::default(),
+            dummy_verifier: false,
+            l1_batch_commit_data_generator_mode: L1BatchCommitmentMode::Rollup,
+        };
+        let genesis_str = serde_json::to_string(&genesis).unwrap();
+
+        // Check that we use backward-compatible name in serialization.
+        // If you want to remove this check, make sure that all the potential clients are updated.
+        assert!(
+            genesis_str.contains("recursion_scheduler_level_vk_hash"),
+            "Serialization should use backward-compatible name"
+        );
+
+        let genesis2: GenesisConfigDto = serde_json::from_str(&genesis_str).unwrap();
+        assert_eq!(genesis, genesis2);
+
+        let genesis_json = r#"{
+            "protocol_version": "0.26.0",
+            "genesis_root_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "genesis_commitment": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "rollup_last_leaf_index": 21,
+            "bootloader_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "default_aa_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "snark_wrapper_vk_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "l1_chain_id": 1,
+            "l2_chain_id": 1,
+            "fee_account": "0x1111111111111111111111111111111111111111",
+            "dummy_verifier": false,
+            "l1_batch_commit_data_generator_mode": "Rollup"
+        }"#;
+        serde_json::from_str::<GenesisConfigDto>(genesis_json).unwrap_or_else(|err| {
+            panic!("Failed to parse genesis config with a new name: {}", err)
+        });
     }
 }

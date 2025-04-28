@@ -1,26 +1,31 @@
 [package]
 name = "zksync_prover_interface"
-version = "0.1.0"
-edition = "2018"
-authors = ["The Matter Labs Team <hello@matterlabs.dev>"]
-homepage = "https://zksync.io/"
-repository = "https://github.com/matter-labs/zksync-era"
-license = "MIT OR Apache-2.0"
-keywords = ["blockchain", "zksync"]
-categories = ["cryptography"]
-readme = "README.md"
+description = "Interfaces for interaction with ZKsync prover subsystem"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-zksync_types = { path = "../types" }
-zksync_object_store = { path = "../object_store" }
+zksync_vm_interface.workspace = true
+zksync_object_store.workspace = true
+zksync_types.workspace = true
 
-zkevm_test_harness = { git = "https://github.com/matter-labs/era-zkevm_test_harness.git", branch = "v1.3.3" }
+# We can use the newest api to send proofs to L1.
+circuit_definitions.workspace = true
+fflonk.workspace = true
+bellman.workspace = true
 
-serde = "1.0.90"
-strum = { version = "0.24", features = ["derive"] }
-serde_with = { version = "1", features = ["base64"] }
-chrono = { version = "0.4", features = ["serde"] }
+serde.workspace = true
+serde_with = { workspace = true, features = ["base64", "hex"] }
+ciborium.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1.21.2", features = ["full"] }
-bincode = "1"
+tokio = { workspace = true, features = ["full"] }
+bincode.workspace = true
+serde_json.workspace = true

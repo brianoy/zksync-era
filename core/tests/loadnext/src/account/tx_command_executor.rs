@@ -1,15 +1,5 @@
 use std::time::Instant;
 
-use zksync::{
-    error::ClientError,
-    ethereum::PriorityOpHolder,
-    utils::{
-        get_approval_based_paymaster_input, get_approval_based_paymaster_input_for_estimation,
-    },
-    web3::ethabi,
-    EthNamespaceClient,
-};
-use zksync_eth_client::EthInterface;
 use zksync_system_constants::MAX_L1_TRANSACTION_GAS_LIMIT;
 use zksync_types::{
     api::{BlockNumber, TransactionReceipt},
@@ -25,6 +15,15 @@ use crate::{
     },
     corrupted_tx::Corrupted,
     report::ReportLabel,
+    sdk::{
+        error::ClientError,
+        ethabi,
+        ethereum::PriorityOpHolder,
+        utils::{
+            get_approval_based_paymaster_input, get_approval_based_paymaster_input_for_estimation,
+        },
+        EthNamespaceClient,
+    },
     utils::format_gwei,
 };
 
@@ -103,7 +102,8 @@ impl AccountLifespan {
         ethereum.set_polling_interval(ETH_POLLING_INTERVAL);
         let gas_price = ethereum
             .client()
-            .get_gas_price("executor")
+            .as_ref()
+            .get_gas_price()
             .await
             .map_err(|_| ClientError::Other)?;
 
@@ -272,7 +272,7 @@ impl AccountLifespan {
 
         let mut builder = wallet
             .start_deploy_contract()
-            .bytecode(self.wallet.test_contract.bytecode.clone())
+            .bytecode(self.wallet.test_contract.bytecode.to_vec())
             .constructor_calldata(constructor_calldata);
 
         let fee = builder
@@ -329,7 +329,7 @@ impl AccountLifespan {
                         U256::zero(),
                         calldata,
                         L1_TRANSACTION_GAS_LIMIT.into(),
-                        Some(self.wallet.test_contract.factory_deps.clone()),
+                        Some(self.wallet.test_contract.factory_deps()),
                         None,
                         None,
                         Default::default(),
@@ -375,12 +375,13 @@ impl AccountLifespan {
     }
 
     fn prepare_calldata_for_loadnext_contract(&self) -> Vec<u8> {
-        let contract = &self.wallet.test_contract.contract;
+        let contract = &self.wallet.test_contract.abi;
         let function = contract.function("execute").unwrap();
         function
             .encode_input(&vec![
                 ethabi::Token::Uint(U256::from(self.contract_execution_params.reads)),
-                ethabi::Token::Uint(U256::from(self.contract_execution_params.writes)),
+                ethabi::Token::Uint(U256::from(self.contract_execution_params.initial_writes)),
+                ethabi::Token::Uint(U256::from(self.contract_execution_params.repeated_writes)),
                 ethabi::Token::Uint(U256::from(self.contract_execution_params.hashes)),
                 ethabi::Token::Uint(U256::from(self.contract_execution_params.events)),
                 ethabi::Token::Uint(U256::from(self.contract_execution_params.recursive_calls)),
@@ -401,7 +402,7 @@ impl AccountLifespan {
             .start_execute_contract()
             .calldata(calldata)
             .contract_address(contract_address)
-            .factory_deps(self.wallet.test_contract.factory_deps.clone());
+            .factory_deps(self.wallet.test_contract.factory_deps());
 
         let fee = builder
             .estimate_fee(Some(get_approval_based_paymaster_input_for_estimation(

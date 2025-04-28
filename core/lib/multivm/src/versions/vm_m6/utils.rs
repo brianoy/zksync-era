@@ -5,10 +5,9 @@ use zk_evm_1_3_1::{
     vm_state::PrimitiveValue,
     zkevm_opcode_defs::FatPointer,
 };
-use zksync_contracts::{read_zbin_bytecode, BaseSystemContracts};
+use zksync_contracts::BaseSystemContracts;
 use zksync_system_constants::ZKPORTER_IS_AVAILABLE;
-use zksync_types::{Address, StorageLogQueryType, H160, MAX_L2_TX_GAS_LIMIT, U256};
-use zksync_utils::h256_to_u256;
+use zksync_types::{h256_to_u256, Address, StorageLogKind, H160, MAX_L2_TX_GAS_LIMIT, U256};
 
 use crate::{
     glue::GlueInto,
@@ -27,7 +26,7 @@ pub const ENTRY_POINT_PAGE: u32 = code_page_candidate_from_base(MemoryPage(INITI
 /// How many gas bootloader is allowed to spend within one block.
 /// Note that this value doesn't correspond to the gas limit of any particular transaction
 /// (except for the fact that, of course, gas limit for each transaction should be <= `BLOCK_GAS_LIMIT`).
-pub const BLOCK_GAS_LIMIT: u32 =
+pub(crate) const BLOCK_GAS_LIMIT: u32 =
     zk_evm_1_3_1::zkevm_opcode_defs::system_params::VM_INITIAL_FRAME_ERGS;
 pub const ETH_CALL_GAS_LIMIT: u32 = MAX_L2_TX_GAS_LIMIT as u32;
 
@@ -256,13 +255,6 @@ pub fn create_test_block_params() -> (BlockContext, BlockProperties) {
     )
 }
 
-pub fn read_bootloader_test_code(test: &str) -> Vec<u8> {
-    read_zbin_bytecode(format!(
-        "contracts/system-contracts/bootloader/tests/artifacts/{}.yul.zbin",
-        test
-    ))
-}
-
 pub(crate) fn calculate_computational_gas_used<
     S: Storage,
     T: PubdataSpentTracer<H>,
@@ -294,5 +286,5 @@ pub(crate) fn calculate_computational_gas_used<
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StorageLogQuery {
     pub log_query: LogQuery,
-    pub log_type: StorageLogQueryType,
+    pub log_type: StorageLogKind,
 }

@@ -1,19 +1,24 @@
 use std::convert::TryInto;
 
 use zksync_types::{
+    address_to_h256,
+    bytecode::BytecodeHash,
     ethabi::{encode, Address, Token},
     fee::{encoding_len, Fee},
+    h256_to_u256,
     l1::is_l1_tx_type,
     l2::{L2Tx, TransactionType},
     transaction_request::{PaymasterParams, TransactionRequest},
-    Bytes, Execute, ExecuteTransactionCommon, L2ChainId, L2TxCommonData, Nonce, Transaction, H256,
-    U256,
+    web3::Bytes,
+    Execute, ExecuteTransactionCommon, L2ChainId, L2TxCommonData, Nonce, Transaction, H256, U256,
 };
-use zksync_utils::{address_to_h256, bytecode::hash_bytecode, bytes_to_be_words, h256_to_u256};
 
-use crate::vm_boojum_integration::{
-    constants::MAX_GAS_PER_PUBDATA_BYTE,
-    utils::overhead::{get_amortized_overhead, OverheadCoefficients},
+use crate::{
+    utils::bytecode::bytes_to_be_words,
+    vm_boojum_integration::{
+        constants::MAX_GAS_PER_PUBDATA_BYTE,
+        utils::overhead::{get_amortized_overhead, OverheadCoefficients},
+    },
 };
 
 /// This structure represents the data that is used by
@@ -22,7 +27,7 @@ use crate::vm_boojum_integration::{
 pub(crate) struct TransactionData {
     pub(crate) tx_type: u8,
     pub(crate) from: Address,
-    pub(crate) to: Address,
+    pub(crate) to: Option<Address>,
     pub(crate) gas_limit: U256,
     pub(crate) pubdata_price_limit: U256,
     pub(crate) max_fee_per_gas: U256,
@@ -91,7 +96,7 @@ impl From<Transaction> for TransactionData {
                     ],
                     data: execute_tx.execute.calldata,
                     signature: common_data.signature,
-                    factory_deps: execute_tx.execute.factory_deps.unwrap_or_default(),
+                    factory_deps: execute_tx.execute.factory_deps,
                     paymaster_input: common_data.paymaster_params.paymaster_input,
                     reserved_dynamic: vec![],
                     raw_bytes: execute_tx.raw_bytes.map(|a| a.0),
@@ -121,7 +126,7 @@ impl From<Transaction> for TransactionData {
                     data: execute_tx.execute.calldata,
                     // The signature isn't checked for L1 transactions so we don't care
                     signature: vec![],
-                    factory_deps: execute_tx.execute.factory_deps.unwrap_or_default(),
+                    factory_deps: execute_tx.execute.factory_deps,
                     paymaster_input: vec![],
                     reserved_dynamic: vec![],
                     raw_bytes: None,
@@ -151,7 +156,7 @@ impl From<Transaction> for TransactionData {
                     data: execute_tx.execute.calldata,
                     // The signature isn't checked for L1 transactions so we don't care
                     signature: vec![],
-                    factory_deps: execute_tx.execute.factory_deps.unwrap_or_default(),
+                    factory_deps: execute_tx.execute.factory_deps,
                     paymaster_input: vec![],
                     reserved_dynamic: vec![],
                     raw_bytes: None,
@@ -169,7 +174,7 @@ impl TransactionData {
         encode(&[Token::Tuple(vec![
             Token::Uint(U256::from_big_endian(&self.tx_type.to_be_bytes())),
             Token::Address(self.from),
-            Token::Address(self.to),
+            Token::Address(self.to.unwrap_or_default()),
             Token::Uint(self.gas_limit),
             Token::Uint(self.pubdata_price_limit),
             Token::Uint(self.max_fee_per_gas),
@@ -190,16 +195,13 @@ impl TransactionData {
         let factory_deps_hashes = self
             .factory_deps
             .iter()
-            .map(|dep| h256_to_u256(hash_bytecode(dep)))
+            .map(|dep| BytecodeHash::for_bytecode(dep).value_u256())
             .collect();
         self.abi_encode_with_custom_factory_deps(factory_deps_hashes)
     }
 
     pub(crate) fn into_tokens(self) -> Vec<U256> {
-        let bytes = self.abi_encode();
-        assert!(bytes.len() % 32 == 0);
-
-        bytes_to_be_words(bytes)
+        bytes_to_be_words(&self.abi_encode())
     }
 
     pub(crate) fn effective_gas_price_per_pubdata(&self, block_gas_price_per_pubdata: u32) -> u32 {
@@ -245,16 +247,17 @@ impl TransactionData {
         }
 
         let l2_tx: L2Tx = self.clone().try_into().unwrap();
-        let transaction_request: TransactionRequest = l2_tx.into();
+        let mut transaction_request: TransactionRequest = l2_tx.into();
+        transaction_request.chain_id = Some(chain_id.as_u64());
 
         // It is assumed that the `TransactionData` always has all the necessary components to recover the hash.
         transaction_request
-            .get_tx_hash(chain_id)
+            .get_tx_hash()
             .expect("Could not recover L2 transaction hash")
     }
 
     fn canonical_l1_tx_hash(&self) -> Result<H256, TxHashCalculationError> {
-        use zksync_types::web3::signing::keccak256;
+        use zksync_types::web3::keccak256;
 
         if !is_l1_tx_type(self.tx_type) {
             return Err(TxHashCalculationError::CannotCalculateL1HashForL2Tx);
@@ -297,12 +300,11 @@ impl TryInto<L2Tx> for TransactionData {
                 paymaster_input: self.paymaster_input,
             },
         };
-        let factory_deps = (!self.factory_deps.is_empty()).then_some(self.factory_deps);
         let execute = Execute {
             contract_address: self.to,
             value: self.value,
             calldata: self.data,
-            factory_deps,
+            factory_deps: self.factory_deps,
         };
 
         Ok(L2Tx {
@@ -325,7 +327,7 @@ mod tests {
         let transaction = TransactionData {
             tx_type: 113,
             from: Address::random(),
-            to: Address::random(),
+            to: Some(Address::random()),
             gas_limit: U256::from(1u32),
             pubdata_price_limit: U256::from(1u32),
             max_fee_per_gas: U256::from(1u32),

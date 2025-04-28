@@ -1,99 +1,133 @@
-use zksync_config::configs::PostgresConfig;
-use zksync_dal::ConnectionPool;
+use zksync_config::configs::{DatabaseSecrets, PostgresConfig};
+use zksync_dal::{ConnectionPool, Core};
 
 use crate::{
-    implementations::resources::pools::{
-        MasterPoolResource, ProverPoolResource, ReplicaPoolResource,
-    },
-    service::ServiceContext,
+    implementations::resources::pools::{MasterPool, PoolResource, ReplicaPool},
     wiring_layer::{WiringError, WiringLayer},
+    IntoContext,
 };
 
+/// Builder for the [`PoolsLayer`].
 #[derive(Debug)]
 pub struct PoolsLayerBuilder {
     config: PostgresConfig,
     with_master: bool,
     with_replica: bool,
-    with_prover: bool,
+    secrets: DatabaseSecrets,
 }
 
 impl PoolsLayerBuilder {
-    pub fn empty(config: PostgresConfig) -> Self {
+    /// Creates a new builder with the provided configuration and secrets.
+    /// By default, no pulls are enabled.
+    pub fn empty(config: PostgresConfig, database_secrets: DatabaseSecrets) -> Self {
         Self {
             config,
             with_master: false,
             with_replica: false,
-            with_prover: false,
+            secrets: database_secrets,
         }
     }
 
+    /// Allows to enable the master pool.
     pub fn with_master(mut self, with_master: bool) -> Self {
         self.with_master = with_master;
         self
     }
 
+    /// Allows to enable the replica pool.
     pub fn with_replica(mut self, with_replica: bool) -> Self {
         self.with_replica = with_replica;
         self
     }
 
-    pub fn with_prover(mut self, with_prover: bool) -> Self {
-        self.with_prover = with_prover;
-        self
-    }
-
+    /// Builds the [`PoolsLayer`] with the provided configuration.
     pub fn build(self) -> PoolsLayer {
         PoolsLayer {
             config: self.config,
+            secrets: self.secrets,
             with_master: self.with_master,
             with_replica: self.with_replica,
-            with_prover: self.with_prover,
         }
     }
 }
 
+/// Wiring layer for connection pools.
+/// During wiring, also prepares the global configuration for the connection pools.
+///
+/// ## Adds resources
+///
+/// - `PoolResource::<MasterPool>` (if master pool is enabled)
+/// - `PoolResource::<ReplicaPool>` (if replica pool is enabled)
 #[derive(Debug)]
 pub struct PoolsLayer {
     config: PostgresConfig,
+    secrets: DatabaseSecrets,
     with_master: bool,
     with_replica: bool,
-    with_prover: bool,
+}
+
+#[derive(Debug, IntoContext)]
+#[context(crate = crate)]
+pub struct Output {
+    pub master_pool: Option<PoolResource<MasterPool>>,
+    pub replica_pool: Option<PoolResource<ReplicaPool>>,
 }
 
 #[async_trait::async_trait]
 impl WiringLayer for PoolsLayer {
+    type Input = ();
+    type Output = Output;
+
     fn layer_name(&self) -> &'static str {
         "pools_layer"
     }
 
-    async fn wire(self: Box<Self>, mut context: ServiceContext<'_>) -> Result<(), WiringError> {
-        if !self.with_master && !self.with_replica && !self.with_prover {
+    async fn wire(self, _input: Self::Input) -> Result<Self::Output, WiringError> {
+        if !self.with_master && !self.with_replica {
             return Err(WiringError::Configuration(
                 "At least one pool should be enabled".to_string(),
             ));
         }
 
-        if self.with_master {
-            let mut master_pool =
-                ConnectionPool::builder(self.config.master_url()?, self.config.max_connections()?);
-            master_pool.set_statement_timeout(self.config.statement_timeout());
-            context.insert_resource(MasterPoolResource::new(master_pool))?;
+        if self.with_master || self.with_replica {
+            if let Some(threshold) = self.config.slow_query_threshold() {
+                ConnectionPool::<Core>::global_config().set_slow_query_threshold(threshold)?;
+            }
+            if let Some(threshold) = self.config.long_connection_threshold() {
+                ConnectionPool::<Core>::global_config().set_long_connection_threshold(threshold)?;
+            }
         }
 
-        if self.with_replica {
-            let mut replica_pool =
-                ConnectionPool::builder(self.config.replica_url()?, self.config.max_connections()?);
-            replica_pool.set_statement_timeout(self.config.statement_timeout());
-            context.insert_resource(ReplicaPoolResource::new(replica_pool))?;
-        }
+        let master_pool = if self.with_master {
+            let pool_size = self.config.max_connections()?;
+            let pool_size_master = self.config.max_connections_master().unwrap_or(pool_size);
 
-        if self.with_prover {
-            let mut prover_pool =
-                ConnectionPool::builder(self.config.prover_url()?, self.config.max_connections()?);
-            prover_pool.set_statement_timeout(self.config.statement_timeout());
-            context.insert_resource(ProverPoolResource::new(prover_pool))?;
-        }
+            Some(PoolResource::<MasterPool>::new(
+                self.secrets.master_url()?,
+                pool_size_master,
+                None,
+                None,
+            ))
+        } else {
+            None
+        };
 
-        Ok(())
+        let replica_pool = if self.with_replica {
+            // We're most interested in setting acquire / statement timeouts for the API server, which puts the most load
+            // on Postgres.
+            Some(PoolResource::<ReplicaPool>::new(
+                self.secrets.replica_url()?,
+                self.config.max_connections()?,
+                self.config.statement_timeout(),
+                self.config.acquire_timeout(),
+            ))
+        } else {
+            None
+        };
+
+        Ok(Output {
+            master_pool,
+            replica_pool,
+        })
     }
 }

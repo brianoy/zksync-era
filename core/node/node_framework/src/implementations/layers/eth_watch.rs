@@ -1,88 +1,154 @@
-use std::time::Duration;
-
-use zksync_config::{ContractsConfig, ETHWatchConfig};
-use zksync_contracts::governance_contract;
-use zksync_core::eth_watch::{client::EthHttpQueryClient, EthWatch};
-use zksync_dal::ConnectionPool;
-use zksync_types::{ethabi::Contract, Address};
+use zksync_config::{
+    configs::contracts::{ecosystem::L1SpecificContracts, SettlementLayerSpecificContracts},
+    EthWatchConfig,
+};
+use zksync_eth_watch::{EthHttpQueryClient, EthWatch, GetLogsClient, ZkSyncExtentionEthClient};
+use zksync_types::L2ChainId;
+use zksync_web3_decl::client::{DynClient, Network};
 
 use crate::{
-    implementations::resources::{eth_interface::EthInterfaceResource, pools::MasterPoolResource},
-    service::{ServiceContext, StopReceiver},
-    task::Task,
+    implementations::resources::{
+        contracts::{
+            L1ChainContractsResource, L1EcosystemContractsResource,
+            SettlementLayerContractsResource,
+        },
+        eth_interface::{
+            EthInterfaceResource, SettlementLayerClient, SettlementLayerClientResource,
+        },
+        pools::{MasterPool, PoolResource},
+        settlement_layer::SettlementModeResource,
+    },
+    service::StopReceiver,
+    task::{Task, TaskId},
     wiring_layer::{WiringError, WiringLayer},
+    FromContext, IntoContext,
 };
 
+/// Wiring layer for ethereum watcher
+///
+/// Responsible for initializing and running of [`EthWatch`] component, that polls the Ethereum node for the relevant events,
+/// such as priority operations (aka L1 transactions), protocol upgrades etc.
 #[derive(Debug)]
 pub struct EthWatchLayer {
-    eth_watch_config: ETHWatchConfig,
-    contracts_config: ContractsConfig,
+    eth_watch_config: EthWatchConfig,
+    chain_id: L2ChainId,
+}
+
+#[derive(Debug, FromContext)]
+#[context(crate = crate)]
+pub struct Input {
+    pub l1_contracts: L1ChainContractsResource,
+    pub contracts_resource: SettlementLayerContractsResource,
+    pub l1ecosystem_contracts_resource: L1EcosystemContractsResource,
+    pub master_pool: PoolResource<MasterPool>,
+    pub eth_client: EthInterfaceResource,
+    pub client: SettlementLayerClientResource,
+    pub settlement_mode: SettlementModeResource,
+}
+
+#[derive(Debug, IntoContext)]
+#[context(crate = crate)]
+pub struct Output {
+    #[context(task)]
+    pub eth_watch: EthWatch,
 }
 
 impl EthWatchLayer {
-    pub fn new(eth_watch_config: ETHWatchConfig, contracts_config: ContractsConfig) -> Self {
+    pub fn new(eth_watch_config: EthWatchConfig, chain_id: L2ChainId) -> Self {
         Self {
             eth_watch_config,
-            contracts_config,
+            chain_id,
         }
+    }
+
+    fn create_client<Net: Network>(
+        &self,
+        client: Box<DynClient<Net>>,
+        contracts_resource: &SettlementLayerSpecificContracts,
+        l1_ecosystem_contracts_resource: &L1SpecificContracts,
+    ) -> EthHttpQueryClient<Net>
+    where
+        Box<DynClient<Net>>: GetLogsClient,
+    {
+        EthHttpQueryClient::new(
+            client,
+            contracts_resource.chain_contracts_config.diamond_proxy_addr,
+            l1_ecosystem_contracts_resource.bytecodes_supplier_addr,
+            l1_ecosystem_contracts_resource.wrapped_base_token_store,
+            l1_ecosystem_contracts_resource.shared_bridge,
+            contracts_resource
+                .ecosystem_contracts
+                .state_transition_proxy_addr,
+            l1_ecosystem_contracts_resource.chain_admin,
+            l1_ecosystem_contracts_resource.server_notifier_addr,
+            self.eth_watch_config.confirmations_for_eth_event,
+            self.chain_id,
+        )
     }
 }
 
 #[async_trait::async_trait]
 impl WiringLayer for EthWatchLayer {
+    type Input = Input;
+    type Output = Output;
+
     fn layer_name(&self) -> &'static str {
         "eth_watch_layer"
     }
 
-    async fn wire(self: Box<Self>, mut context: ServiceContext<'_>) -> Result<(), WiringError> {
-        let pool_resource = context.get_resource::<MasterPoolResource>().await?;
-        let main_pool = pool_resource.get().await.unwrap();
+    async fn wire(self, input: Self::Input) -> Result<Self::Output, WiringError> {
+        let main_pool = input.master_pool.get().await?;
+        let client = input.eth_client.0;
 
-        let client = context.get_resource::<EthInterfaceResource>().await?.0;
-
-        let eth_client = EthHttpQueryClient::new(
-            client,
-            self.contracts_config.diamond_proxy_addr,
-            Some(self.contracts_config.governance_addr),
-            self.eth_watch_config.confirmations_for_eth_event,
+        tracing::info!(
+            "Diamond proxy address settlement_layer: {:#?}",
+            input
+                .contracts_resource
+                .0
+                .chain_contracts_config
+                .diamond_proxy_addr
         );
-        context.add_task(Box::new(EthWatchTask {
+
+        let l1_client = self.create_client(
+            client,
+            &input.l1_contracts.0,
+            &input.l1ecosystem_contracts_resource.0,
+        );
+
+        let sl_l2_client: Box<dyn ZkSyncExtentionEthClient> = match input.client.0 {
+            SettlementLayerClient::L1(client) => Box::new(self.create_client(
+                client,
+                &input.contracts_resource.0,
+                &input.l1ecosystem_contracts_resource.0,
+            )),
+            SettlementLayerClient::L2(client) => Box::new(self.create_client(
+                client,
+                &input.contracts_resource.0,
+                &input.l1ecosystem_contracts_resource.0,
+            )),
+        };
+
+        let eth_watch = EthWatch::new(
+            Box::new(l1_client),
+            sl_l2_client,
+            input.settlement_mode.0,
             main_pool,
-            client: eth_client,
-            governance_contract: Some(governance_contract()),
-            diamond_proxy_address: self.contracts_config.diamond_proxy_addr,
-            poll_interval: self.eth_watch_config.poll_interval(),
-        }));
+            self.eth_watch_config.poll_interval(),
+            self.chain_id,
+        )
+        .await?;
 
-        Ok(())
+        Ok(Output { eth_watch })
     }
-}
-
-#[derive(Debug)]
-struct EthWatchTask {
-    main_pool: ConnectionPool,
-    client: EthHttpQueryClient,
-    governance_contract: Option<Contract>,
-    diamond_proxy_address: Address,
-    poll_interval: Duration,
 }
 
 #[async_trait::async_trait]
-impl Task for EthWatchTask {
-    fn name(&self) -> &'static str {
-        "eth_watch"
+impl Task for EthWatch {
+    fn id(&self) -> TaskId {
+        "eth_watch".into()
     }
 
     async fn run(self: Box<Self>, stop_receiver: StopReceiver) -> anyhow::Result<()> {
-        let eth_watch = EthWatch::new(
-            self.diamond_proxy_address,
-            self.governance_contract,
-            Box::new(self.client),
-            self.main_pool,
-            self.poll_interval,
-        )
-        .await;
-
-        eth_watch.run(stop_receiver.0).await
+        (*self).run(stop_receiver.0).await
     }
 }

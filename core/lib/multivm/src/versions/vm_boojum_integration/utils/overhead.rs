@@ -1,7 +1,6 @@
 use zk_evm_1_4_0::zkevm_opcode_defs::system_params::MAX_TX_ERGS_LIMIT;
 use zksync_system_constants::MAX_L2_TX_GAS_LIMIT;
-use zksync_types::{l1::is_l1_tx_type, U256};
-use zksync_utils::ceil_div_u256;
+use zksync_types::{ceil_div_u256, l1::is_l1_tx_type, U256};
 
 use crate::vm_boojum_integration::constants::{
     BLOCK_OVERHEAD_GAS, BLOCK_OVERHEAD_PUBDATA, BOOTLOADER_TX_ENCODING_SPACE, MAX_TXS_IN_BLOCK,
@@ -9,14 +8,14 @@ use crate::vm_boojum_integration::constants::{
 
 /// Derives the overhead for processing transactions in a block.
 pub(crate) fn derive_overhead(
-    gas_limit: u32,
+    gas_limit: u64,
     gas_price_per_pubdata: u32,
     encoded_len: usize,
     coefficients: OverheadCoefficients,
 ) -> u32 {
     // Even if the gas limit is greater than the `MAX_TX_ERGS_LIMIT`, we assume that everything beyond `MAX_TX_ERGS_LIMIT`
     // will be spent entirely on publishing bytecodes and so we derive the overhead solely based on the capped value
-    let gas_limit = std::cmp::min(MAX_TX_ERGS_LIMIT, gas_limit);
+    let gas_limit = std::cmp::min(MAX_TX_ERGS_LIMIT as u64, gas_limit);
 
     // Using large `U256` type to avoid overflow
     let max_block_overhead = U256::from(block_overhead_gas(gas_price_per_pubdata));
@@ -64,6 +63,7 @@ pub(crate) fn derive_overhead(
 }
 
 /// Contains the coefficients with which the overhead for transactions will be calculated.
+///
 /// All of the coefficients should be <= 1. There are here to provide a certain "discount" for normal transactions
 /// at the risk of malicious transactions that may close the block prematurely.
 /// IMPORTANT: to perform correct computations, `MAX_TX_ERGS_LIMIT / coefficients.ergs_limit_overhead_coeficient` MUST
@@ -241,7 +241,7 @@ pub(crate) fn get_amortized_overhead(
     if limit_after_deducting_overhead.as_u64() > MAX_L2_TX_GAS_LIMIT {
         // We derive the same overhead that would exist for the MAX_L2_TX_GAS_LIMIT ergs
         derive_overhead(
-            MAX_L2_TX_GAS_LIMIT as u32,
+            MAX_L2_TX_GAS_LIMIT,
             gas_per_pubdata_byte_limit,
             encoded_len.as_usize(),
             coefficients,
@@ -280,7 +280,7 @@ mod tests {
         // is >= than the overhead proposed by the operator.
         let is_overhead_accepted = |suggested_overhead: u32| {
             let derived_overhead = derive_overhead(
-                total_gas_limit - suggested_overhead,
+                (total_gas_limit - suggested_overhead) as u64,
                 gas_per_pubdata_byte_limit,
                 encoded_len,
                 coefficients,
@@ -334,7 +334,7 @@ mod tests {
 
         // Relatively big parameters
         let max_tx_overhead = derive_overhead(
-            MAX_TX_ERGS_LIMIT,
+            MAX_TX_ERGS_LIMIT as u64,
             5000,
             10000,
             OverheadCoefficients::new_l2(),

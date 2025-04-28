@@ -1,81 +1,37 @@
 use crate::{
-    interface::{ExecutionResult, VmExecutionMode, VmInterface},
-    vm_latest::{
-        tests::tester::{TxType, VmTesterBuilder},
-        HistoryDisabled,
+    versions::testonly::simple_execution::{
+        test_create2_deployment_address, test_estimate_fee, test_reusing_create2_salt,
+        test_reusing_create_address, test_simple_execute, test_transfer_to_self_with_low_gas_limit,
     },
+    vm_latest::{HistoryEnabled, Vm},
 };
 
 #[test]
 fn estimate_fee() {
-    let mut vm_tester = VmTesterBuilder::new(HistoryDisabled)
-        .with_empty_in_memory_storage()
-        .with_deployer()
-        .with_random_rich_accounts(1)
-        .build();
-
-    vm_tester.deploy_test_contract();
-    let account = &mut vm_tester.rich_accounts[0];
-
-    let tx = account.get_test_contract_transaction(
-        vm_tester.test_contract.unwrap(),
-        false,
-        Default::default(),
-        false,
-        TxType::L2,
-    );
-
-    vm_tester.vm.push_transaction(tx);
-
-    let result = vm_tester.vm.execute(VmExecutionMode::OneTx);
-    assert!(matches!(result.result, ExecutionResult::Success { .. }));
+    test_estimate_fee::<Vm<_, HistoryEnabled>>();
 }
 
 #[test]
 fn simple_execute() {
-    let mut vm_tester = VmTesterBuilder::new(HistoryDisabled)
-        .with_empty_in_memory_storage()
-        .with_deployer()
-        .with_random_rich_accounts(1)
-        .build();
+    test_simple_execute::<Vm<_, HistoryEnabled>>();
+}
 
-    vm_tester.deploy_test_contract();
+#[test]
+fn create2_deployment_address() {
+    test_create2_deployment_address::<Vm<_, HistoryEnabled>>();
+}
 
-    let account = &mut vm_tester.rich_accounts[0];
+#[test]
+fn reusing_create_address() {
+    test_reusing_create_address::<Vm<_, HistoryEnabled>>();
+}
 
-    let tx1 = account.get_test_contract_transaction(
-        vm_tester.test_contract.unwrap(),
-        false,
-        Default::default(),
-        false,
-        TxType::L1 { serial_id: 1 },
-    );
+#[test]
+fn reusing_create2_salt() {
+    test_reusing_create2_salt::<Vm<_, HistoryEnabled>>();
+}
 
-    let tx2 = account.get_test_contract_transaction(
-        vm_tester.test_contract.unwrap(),
-        true,
-        Default::default(),
-        false,
-        TxType::L1 { serial_id: 1 },
-    );
-
-    let tx3 = account.get_test_contract_transaction(
-        vm_tester.test_contract.unwrap(),
-        false,
-        Default::default(),
-        false,
-        TxType::L1 { serial_id: 1 },
-    );
-    let vm = &mut vm_tester.vm;
-    vm.push_transaction(tx1);
-    vm.push_transaction(tx2);
-    vm.push_transaction(tx3);
-    let tx = vm.execute(VmExecutionMode::OneTx);
-    assert!(matches!(tx.result, ExecutionResult::Success { .. }));
-    let tx = vm.execute(VmExecutionMode::OneTx);
-    assert!(matches!(tx.result, ExecutionResult::Revert { .. }));
-    let tx = vm.execute(VmExecutionMode::OneTx);
-    assert!(matches!(tx.result, ExecutionResult::Success { .. }));
-    let block_tip = vm.execute(VmExecutionMode::Batch);
-    assert!(matches!(block_tip.result, ExecutionResult::Success { .. }));
+#[test]
+fn transfer_to_self_with_low_gas_limit() {
+    test_transfer_to_self_with_low_gas_limit::<Vm<_, HistoryEnabled>>();
 }

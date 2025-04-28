@@ -10,14 +10,11 @@
 //! Link to @Deniallugo's PR to web3: https://github.com/tomusdrw/rust-web3/pull/630
 
 use rlp::RlpStream;
-use zksync_types::{
-    ethabi::Address,
-    web3::{
-        signing::{self, Signature},
-        types::{AccessList, SignedTransaction},
-    },
-    H256, U256, U64,
+use zksync_basic_types::{
+    web3::{keccak256, AccessList, Signature, SignedTransaction},
+    Address, H256, U256, U64,
 };
+use zksync_crypto_primitives::K256PrivateKey;
 
 const LEGACY_TX_ID: u64 = 0;
 const ACCESSLISTS_TX_ID: u64 = 1;
@@ -244,29 +241,26 @@ impl Transaction {
     }
 
     /// Sign and return a raw signed transaction.
-    pub fn sign(self, sign: impl signing::Key, chain_id: u64) -> SignedTransaction {
+    pub fn sign(self, private_key: &K256PrivateKey, chain_id: u64) -> SignedTransaction {
         let adjust_v_value = matches!(
             self.transaction_type.map(|t| t.as_u64()),
             Some(LEGACY_TX_ID) | None
         );
 
         let encoded = self.encode(chain_id, None);
-
-        let hash = signing::keccak256(encoded.as_ref());
+        let message_hash = H256(keccak256(encoded.as_ref()));
 
         let signature = if adjust_v_value {
-            sign.sign(&hash, Some(chain_id))
-                .expect("hash is non-zero 32-bytes; qed")
+            private_key.sign_web3(&message_hash, Some(chain_id))
         } else {
-            sign.sign_message(&hash)
-                .expect("hash is non-zero 32-bytes; qed")
+            private_key.sign_web3_message(&message_hash)
         };
 
         let signed = self.encode(chain_id, Some(&signature));
-        let transaction_hash = signing::keccak256(signed.as_ref()).into();
+        let transaction_hash = keccak256(signed.as_ref()).into();
 
         SignedTransaction {
-            message_hash: hash.into(),
+            message_hash,
             v: signature.v,
             r: signature.r,
             s: signature.s,

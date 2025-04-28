@@ -1,48 +1,54 @@
-use zksync_config::{configs::chain::StateKeeperConfig, DBConfig};
-use zksync_core::state_keeper::MainBatchExecutor;
+use zksync_types::vm::FastVmMode;
+use zksync_vm_executor::batch::{BatchTracer, MainBatchExecutorFactory, TraceCalls};
 
 use crate::{
-    implementations::resources::{pools::MasterPoolResource, state_keeper::BatchExecutorResource},
-    resource::Unique,
-    service::ServiceContext,
+    implementations::resources::state_keeper::BatchExecutorResource,
     wiring_layer::{WiringError, WiringLayer},
 };
 
+/// Wiring layer for `MainBatchExecutor`, part of the state keeper responsible for running the VM.
 #[derive(Debug)]
 pub struct MainBatchExecutorLayer {
-    db_config: DBConfig,
-    state_keeper_config: StateKeeperConfig,
+    save_call_traces: bool,
+    optional_bytecode_compression: bool,
+    fast_vm_mode: FastVmMode,
 }
 
 impl MainBatchExecutorLayer {
-    pub fn new(db_config: DBConfig, state_keeper_config: StateKeeperConfig) -> Self {
+    pub fn new(save_call_traces: bool, optional_bytecode_compression: bool) -> Self {
         Self {
-            db_config,
-            state_keeper_config,
+            save_call_traces,
+            optional_bytecode_compression,
+            fast_vm_mode: FastVmMode::default(),
         }
+    }
+
+    pub fn with_fast_vm_mode(mut self, mode: FastVmMode) -> Self {
+        self.fast_vm_mode = mode;
+        self
+    }
+
+    fn create_executor<Tr: BatchTracer>(&self) -> BatchExecutorResource {
+        let mut executor = MainBatchExecutorFactory::<Tr>::new(self.optional_bytecode_compression);
+        executor.set_fast_vm_mode(self.fast_vm_mode);
+        executor.into()
     }
 }
 
 #[async_trait::async_trait]
 impl WiringLayer for MainBatchExecutorLayer {
+    type Input = ();
+    type Output = BatchExecutorResource;
+
     fn layer_name(&self) -> &'static str {
         "main_batch_executor_layer"
     }
 
-    async fn wire(self: Box<Self>, mut context: ServiceContext<'_>) -> Result<(), WiringError> {
-        let master_pool = context.get_resource::<MasterPoolResource>().await?;
-
-        let builder = MainBatchExecutor::new(
-            self.db_config.state_keeper_db_path,
-            master_pool.get_singleton().await?,
-            self.state_keeper_config.max_allowed_l2_tx_gas_limit.into(),
-            self.state_keeper_config.save_call_traces,
-            self.state_keeper_config.upload_witness_inputs_to_gcs,
-            self.state_keeper_config.enum_index_migration_chunk_size(),
-            false,
-        );
-
-        context.insert_resource(BatchExecutorResource(Unique::new(Box::new(builder))))?;
-        Ok(())
+    async fn wire(self, (): Self::Input) -> Result<Self::Output, WiringError> {
+        Ok(if self.save_call_traces {
+            self.create_executor::<TraceCalls>()
+        } else {
+            self.create_executor::<()>()
+        })
     }
 }
